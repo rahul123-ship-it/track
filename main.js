@@ -31,6 +31,20 @@ let VOLUME_THRESHOLD = parseInt(process.env.VOLUME_THRESHOLD, 10) || 100_000_000
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL, 10) || 5 * 60 * 1000; // 5 minutes
 const ALERT_COOLDOWN = parseInt(process.env.ALERT_COOLDOWN, 10) || 1 * 60 * 1000; // 1 minute cooldown for alerts
 
+// Flat EMA filter configuration - suppresses alerts during sideways markets
+const FLAT_EMA_PERIODS = 5; // Number of candles to look back for slope calculation
+const FLAT_EMA_HYSTERESIS = 2; // Required consecutive non-flat readings before allowing alerts
+// Per-timeframe thresholds: faster TFs need smaller thresholds (in percent)
+const FLAT_EMA_THRESHOLDS = {
+    '1m': 0.005,   // 0.005% for 1m (5 candles = 5 minutes)
+    '3m': 0.008,   // 0.008% for 3m (5 candles = 15 minutes)
+    '5m': 0.012,   // 0.012% for 5m (5 candles = 25 minutes)
+    '15m': 0.02,   // 0.02% for 15m (5 candles = 75 minutes)
+    '1h': 0.04,    // 0.04% for 1h (5 candles = 5 hours)
+    '4h': 0.08,    // 0.08% for 4h
+    '1d': 0.15     // 0.15% for 1d
+};
+
 // Telegram configuration — must be provided via environment variables
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -89,6 +103,9 @@ bot.on('polling_error', (error) => {
 const lastAlerts = new Map();
 const coinStates = new Map(); // Tracks the current state of each coin (above/below EMA)
 const trackedPairs = new Set(); // Keep track of pairs we're already monitoring
+// Flat EMA hysteresis counters: tracks consecutive non-flat readings per symbol/tf
+// Key format: symbol_tf (e.g., "BTCUSDT_5m") or just symbol in single-mode
+const flatEmaHysteresisCounters = new Map();
 
 // Persist and restore alert state so restarts don't re-fire existing crossovers
 const ALERT_STATE_PATH = path.join(__dirname, 'alert_state.json');
@@ -134,6 +151,81 @@ const lastWsCandleTs = new Map(); // Guard against duplicate candlestick events 
 const oiSnapshotCache = new Map(); // Cache latest OI per symbol for delta calculation
 // Composite cache key for dual-TF mode — "BTCUSDT_5m" / "BTCUSDT_15m"
 function tfKey(symbol, tf) { return `${symbol}_${tf}`; }
+
+/**
+ * Check if EMA is flat (sideways market) to suppress false crossover alerts.
+ * Uses per-timeframe thresholds and hysteresis to avoid chop.
+ *
+ * @param {string} symbol - Trading pair symbol
+ * @param {string} tf - Timeframe (e.g., '5m', '15m') or '' for single-mode
+ * @param {boolean} useDualEma - Whether to check EMA15 (dual mode) or single EMA
+ * @returns {Object} { isFlat: boolean, reason: string|null }
+ */
+function isEmaFlat(symbol, tf = '', useDualEma = false) {
+    // Build correct cache key for dual mode
+    const cacheKey = tf ? tfKey(symbol, tf) : symbol;
+    const hysteresisKey = cacheKey;
+
+    // Get EMA values from appropriate cache
+    const emaValues = useDualEma
+        ? (ema15Cache.get(cacheKey) || [])
+        : (emaCache.get(cacheKey) || []);
+
+    // CRITICAL: Bounds check - need at least FLAT_EMA_PERIODS + 1 entries
+    // (to exclude live candle and have enough history)
+    if (emaValues.length <= FLAT_EMA_PERIODS + 1) {
+        return { isFlat: false, reason: 'insufficient_data' };
+    }
+
+    // Exclude the live (unclosed) candle - use only closed candles for slope calculation
+    // This prevents false flat readings mid-candle during consolidation
+    const closedEmaValues = emaValues.slice(0, -1);
+    const lastEMA = closedEmaValues[closedEmaValues.length - 1];
+    const pastEMA = closedEmaValues[closedEmaValues.length - 1 - FLAT_EMA_PERIODS];
+
+    // Guard against invalid values
+    if (!lastEMA || !pastEMA || pastEMA === 0) {
+        return { isFlat: false, reason: 'invalid_ema_values' };
+    }
+
+    // Calculate EMA change percentage over the lookback period
+    const emaChangePct = Math.abs((lastEMA - pastEMA) / pastEMA * 100);
+
+    // Get threshold for this timeframe (default to 0.02% if not found)
+    const threshold = FLAT_EMA_THRESHOLDS[tf || TIMEFRAME] || 0.02;
+
+    // Check if EMA is flat
+    const isCurrentlyFlat = emaChangePct < threshold;
+
+    // Hysteresis: require FLAT_EMA_HYSTERESIS consecutive non-flat readings before allowing alerts
+    let consecutiveNonFlat = flatEmaHysteresisCounters.get(hysteresisKey) || 0;
+
+    if (isCurrentlyFlat) {
+        // Reset hysteresis counter when flat
+        flatEmaHysteresisCounters.set(hysteresisKey, 0);
+        return {
+            isFlat: true,
+            reason: `EMA slope ${emaChangePct.toFixed(4)}% < threshold ${threshold}% (${FLAT_EMA_PERIODS} periods)`
+        };
+    } else {
+        // Increment counter for non-flat reading
+        consecutiveNonFlat++;
+        flatEmaHysteresisCounters.set(hysteresisKey, consecutiveNonFlat);
+
+        // Only allow alerts after hysteresis threshold is met
+        if (consecutiveNonFlat < FLAT_EMA_HYSTERESIS) {
+            return {
+                isFlat: true,
+                reason: `hysteresis: ${consecutiveNonFlat}/${FLAT_EMA_HYSTERESIS} consecutive non-flat readings (${emaChangePct.toFixed(4)}%)`
+            };
+        }
+
+        // Reset counter after allowing alert to require hysteresis again next time
+        flatEmaHysteresisCounters.set(hysteresisKey, 0);
+        return { isFlat: false, reason: null };
+    }
+}
+
 const trainingData = new Map(); // Store historical data for ML training
 const modelPerformance = new Map(); // Track ML model accuracy
 const reconnectionAttempts = new Map(); // Track reconnection attempts (keyed by pool index: "pool_0", "pool_1", …)
@@ -195,8 +287,19 @@ async function safeSendAlert(chatId, text, opts) {
 }
 
 // Build a chart URL for a given symbol on TradingView (using Delta Exchange data)
-function getChartUrl(symbol) {
-    return `https://www.tradingview.com/chart/?symbol=DELTA:${symbol}`;
+// Delta Exchange trades perpetual futures, so symbols need .P suffix on TradingView
+function getChartUrl(symbol, tf = '') {
+    // Ensure symbol has .P suffix for perpetual futures (required for Delta Exchange on TradingView)
+    const tvSymbol = symbol.endsWith('.P') ? symbol : `${symbol}.P`;
+
+    // Map bot timeframe to TradingView interval
+    const timeframe = tf || TIMEFRAME;
+    const tvInterval = timeframe; // TradingView uses same format: 1m, 5m, 15m, 1h, 4h, 1d
+
+    // Primary: TradingView with Delta Exchange data
+    const tradingViewUrl = `https://www.tradingview.com/chart/?symbol=DELTA:${tvSymbol}&interval=${tvInterval}`;
+
+    return tradingViewUrl;
 }
 // Returns a human-readable timeframe label for the current mode.
 // Dual mode doesn't have a single TF, so we reflect the actual tf arg or show both.
@@ -871,8 +974,9 @@ function setupPoolConnection(index, symbols) {
                     l: message.l,
                     c: message.c,
                     v: message.v || 0,
-                    // Delta candlestick channel sends last closed candle snapshot.
-                    x: true
+                    // Use message.x if provided by API, default to true for backward compatibility
+                    // This ensures we only process actual closed candles, not mid-candle updates
+                    x: message.x !== undefined ? message.x : true
                 };
 
                 if (kline.x === true) {
@@ -1040,9 +1144,10 @@ async function processClosedCandle(symbol, kline, tf = null) {
         let klines = klineCache.get(cacheKey) || [];
 
         // Determine if it's a new candle bucket based on timeframe
+        // Use the candle's own timestamp (kline.t) instead of Date.now() to handle delayed WS messages correctly
         const tfSecs = timeframeToSeconds(tf || TIMEFRAME);
         const tfMs = tfSecs * 1000;
-        const candleTimeMs = Math.floor(Date.now() / tfMs) * tfMs;
+        const candleTimeMs = Math.floor((kline.t * 1000) / tfMs) * tfMs;
 
         // Ignore stale messages that are older than our most recent candle
         if (klines.length > 0 && candleTimeMs < klines[klines.length - 1].time) {
@@ -1479,6 +1584,16 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
                 console.log(`  ML Prediction: ${prediction.toFixed(2)}% expected change`.cyan);
             }
 
+            // CRITICAL: Check flat EMA BEFORE calling shouldAlert() to avoid wasting cooldown
+            const flatCheck = isEmaFlat(symbol, '', false); // single-mode, useDualEma = false
+
+            if (flatCheck.isFlat) {
+                // Update state so next real crossover is detected, but don't consume cooldown
+                coinStates.set(symbol, currentState);
+                console.log(`  ⏸️  Alert suppressed: ${flatCheck.reason}`.gray);
+                return;
+            }
+
             if (shouldAlert(symbol, currentState)) {
                 if (prediction !== null) {
                     await sendTelegramAlertWithML(symbol, 'up', lastPrice, lastEMA, difference, prediction);
@@ -1497,6 +1612,16 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
 
             if (prediction !== null) {
                 console.log(`  ML Prediction: ${prediction.toFixed(2)}% expected change`.cyan);
+            }
+
+            // CRITICAL: Check flat EMA BEFORE calling shouldAlert() to avoid wasting cooldown
+            const flatCheck = isEmaFlat(symbol, '', false); // single-mode, useDualEma = false
+
+            if (flatCheck.isFlat) {
+                // Update state so next real crossover is detected, but don't consume cooldown
+                coinStates.set(symbol, currentState);
+                console.log(`  ⏸️  Alert suppressed: ${flatCheck.reason}`.gray);
+                return;
             }
 
             if (shouldAlert(symbol, currentState)) {
@@ -1533,6 +1658,17 @@ async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, l
             console.log(`  Price: ${formatPrice(currentPrice).white}`);
             console.log(`  EMA Spread: ${difference.toFixed(4)}%`.yellow);
 
+            // CRITICAL: Check flat EMA BEFORE calling shouldAlert() to avoid wasting cooldown
+            const flatCheck = isEmaFlat(symbol, tf, true); // useDualEma = true (check EMA15)
+            const stateKey = tf ? tfKey(symbol, tf) : symbol;
+
+            if (flatCheck.isFlat) {
+                // Update state so next real crossover is detected, but don't consume cooldown
+                coinStates.set(stateKey, currentState);
+                console.log(`  ⏸️  Alert suppressed: ${flatCheck.reason}`.gray);
+                return;
+            }
+
             if (shouldAlert(symbol, currentState, tf)) {
                 await sendDualEmaAlert(symbol, 'up', currentPrice, lastEma9, lastEma15, difference, tf);
             }
@@ -1545,6 +1681,17 @@ async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, l
             console.log(`  EMA(15): ${formatPrice(prevEma15).gray} → ${formatPrice(lastEma15).cyan}`);
             console.log(`  Price: ${formatPrice(currentPrice).white}`);
             console.log(`  EMA Spread: ${difference.toFixed(4)}%`.yellow);
+
+            // CRITICAL: Check flat EMA BEFORE calling shouldAlert() to avoid wasting cooldown
+            const flatCheck = isEmaFlat(symbol, tf, true); // useDualEma = true (check EMA15)
+            const stateKey = tf ? tfKey(symbol, tf) : symbol;
+
+            if (flatCheck.isFlat) {
+                // Update state so next real crossover is detected, but don't consume cooldown
+                coinStates.set(stateKey, currentState);
+                console.log(`  ⏸️  Alert suppressed: ${flatCheck.reason}`.gray);
+                return;
+            }
 
             if (shouldAlert(symbol, currentState, tf)) {
                 await sendDualEmaAlert(symbol, 'down', currentPrice, lastEma9, lastEma15, difference, tf);
@@ -1573,8 +1720,8 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, t
         const stats = await get24HrStats(symbol);
         const oi = await getOIDelta(symbol).catch(() => null);
 
-        // Chart link
-        const chartUrl = getChartUrl(symbol);
+        // Chart link - pass timeframe for correct interval on TradingView
+        const chartUrl = getChartUrl(symbol, tf);
 
         const oiLine = oi
             ? `<b>OI Delta:</b> ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '\u{1F4C8} new money (stronger)' : oi.deltaPercent <= -0.5 ? '\u{1F4C9} liquidation (weaker)' : '\u2192 neutral'}\n`
@@ -1590,7 +1737,7 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, t
             oiLine +
             `<b>Timeframe:</b> ${activeTimeframeLabel(tf)}\n\n` +
             `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-            `<a href="${chartUrl}">View Chart on Delta Exchange</a>`;
+            `<a href="${chartUrl}">View Chart on TradingView</a>`;
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'HTML',
@@ -1757,6 +1904,9 @@ async function setupAllWebSockets() {
                 for (const key of [...lastAlerts.keys()].filter(k => k === symbol || k.startsWith(`${symbol}_`))) {
                     lastAlerts.delete(key);
                 }
+                for (const key of [...flatEmaHysteresisCounters.keys()].filter(k => k === symbol || k.startsWith(`${symbol}_`))) {
+                    flatEmaHysteresisCounters.delete(key);
+                }
             }
         }
 
@@ -1792,6 +1942,12 @@ async function fetchInChunks(factories, chunkSize = 8, delayMs = 1500) {
 }
 
 // Check for EMA crossovers (traditional method, still used for initial load and periodic checks)
+// NOTE: Race condition awareness — Both checkEMACross() (periodic) and processClosedCandle() (WebSocket)
+// can call shouldAlert() concurrently. In Node.js, two async chains can read the same coinStates value
+// before either writes back, because await in get24HrStats() and getOIDelta() yields the event loop.
+// The flat EMA check (synchronous in isEmaFlat) does not eliminate this window — both chains can still
+// pass the filter and race into shouldAlert(). This is a known architectural limitation.
+// Mitigation: ALERT_COOLDOWN prevents immediate duplicate alerts, but very rare duplicates may still occur.
 async function checkEMACross() {
     try {
         const pairs = await getFuturesPairs();
@@ -2132,7 +2288,7 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
             `<b>Timeframe:</b> ${activeTimeframeLabel()}\n` +
             `<b>ML Prediction:</b> ${confidenceEmoji} ${prediction.toFixed(2)}% (24h)\n\n` +
             `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-            `<a href="${chartUrl}">View Chart on Delta Exchange</a>`;
+            `<a href="${chartUrl}">View Chart on TradingView</a>`;
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'HTML',
