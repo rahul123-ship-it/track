@@ -9,8 +9,8 @@ const net = require('net');
 const TelegramBot = require('node-telegram-bot-api');
 const notifier = require('node-notifier');
 const WebSocket = require('ws');
-const { createObjectCsvWriter } = require('csv-writer');
 const http = require('http');
+const { createMLRuntime } = require('./src/ml/runtime');
 const DELTA_REST_BASE_URL = 'https://api.india.delta.exchange/v2';
 const DELTA_PUBLIC_WS_URL = 'wss://public-socket.india.delta.exchange';
 
@@ -147,7 +147,7 @@ const klineCache = new Map(); // Cache for kline data
 const emaCache = new Map(); // Cache for calculated EMAs
 const ema9Cache = new Map(); // Cache for EMA(9) values (dual mode)
 const ema15Cache = new Map(); // Cache for EMA(15) values (dual mode)
-const lastWsCandleTs = new Map(); // Guard against duplicate candlestick events per symbol/tf
+const lastWsCandleTs = new Map(); // Tracks last seen WS event timestamp per symbol/tf (diagnostic only)
 const oiSnapshotCache = new Map(); // Cache latest OI per symbol for delta calculation
 // Composite cache key for dual-TF mode — "BTCUSDT_5m" / "BTCUSDT_15m"
 function tfKey(symbol, tf) { return `${symbol}_${tf}`; }
@@ -226,8 +226,7 @@ function isEmaFlat(symbol, tf = '', useDualEma = false) {
     }
 }
 
-const trainingData = new Map(); // Store historical data for ML training
-const modelPerformance = new Map(); // Track ML model accuracy
+let mlRuntime = null; // Initialized in initialize() after core services are ready
 const reconnectionAttempts = new Map(); // Track reconnection attempts (keyed by pool index: "pool_0", "pool_1", …)
 const MAX_RECONNECTION_ATTEMPTS = 5;
 const RECONNECTION_DELAY = 5000; // 5 seconds
@@ -238,6 +237,7 @@ const MIN_CROSS_PCT = 0.0003; // 0.03% minimum crossover margin to reduce whipsa
 const VALID_VOLUMES    = [2_000_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000, 100_000_000, 200_000_000];
 const VALID_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h'];
 const VALID_EMA_PERIODS = [50, 100, 200];
+const ALERT_TRACE_ENABLED = (process.env.ALERT_TRACE || 'false').toLowerCase() === 'true';
 let isReconnecting = false; // Prevents stacked reconnectionsduring graceful restarts
 let monitoringInterval = null; // Reference to the periodic check interval
 
@@ -263,6 +263,11 @@ function beginCommand(command) {
 
 function endCommand(command) {
     commandCooldown.set(command, { running: false, lastRunAt: Date.now() });
+}
+
+function traceAlert(message) {
+    if (!ALERT_TRACE_ENABLED) return;
+    log(`[ALERT_TRACE] ${message}`, 'info');
 }
 
 // Telegram circuit breaker — pauses alert sends after 5 consecutive failures
@@ -318,7 +323,16 @@ function timeframeToSeconds(tf) {
     };
     return map[tf] || 300;
 }
-let _indicatorsModule = null; // Cached module ref — avoids repeated require() on every closed candle
+
+// Normalize websocket timestamps to seconds.
+// Delta payloads can differ by environment (seconds/ms/microseconds).
+function normalizeWsTimestamp(rawTs) {
+    const n = Number(rawTs);
+    if (!Number.isFinite(n) || n <= 0) return Math.floor(Date.now() / 1000);
+    if (n > 1e15) return Math.floor(n / 1e6); // microseconds -> seconds
+    if (n > 1e11) return Math.floor(n / 1000); // milliseconds -> seconds
+    return Math.floor(n); // already seconds
+}
 // Rate limiting for API calls
 const API_RATE_LIMIT = 1200; // 1.2 seconds between API calls
 let lastApiCall = 0;
@@ -405,21 +419,7 @@ function log(message, type = 'info') {
 
 // Check if TensorFlow.js can be loaded
 function checkTensorFlowAvailability() {
-    try {
-        require('@tensorflow/tfjs-node');
-        log('TensorFlow.js is available', 'success');
-        return true;
-    } catch (e) {
-        try {
-            require('@tensorflow/tfjs-node-cpu');
-            log('TensorFlow.js CPU version is available', 'warning');
-            return true;
-        } catch (e2) {
-            log(`TensorFlow.js is not available: ${e2.message}`, 'error');
-            log('ML predictions will be disabled', 'warning');
-            return false;
-        }
-    }
+    return mlRuntime ? mlRuntime.checkTensorFlowAvailability() : false;
 }
 
 // Resolve SnoreToast binary bundled with node-notifier (Windows only)
@@ -912,9 +912,11 @@ function shouldAlert(symbol, currentState, tf = '') {
         coinStates.set(stateKey, currentState);
         lastAlerts.set(alertKey, now);
         saveAlertState();
+        traceAlert(`${symbol}${tf ? ` [${tf}]` : ''} state change ${previousState || 'none'} -> ${currentState}; alert allowed`);
         return true;
     } else if (previousState !== currentState) {
         log(`Alert for ${symbol}${tf ? ` [${tf.toUpperCase()}]` : ''} (${currentState}) skipped due to cooldown.`, 'warning');
+        traceAlert(`${symbol}${tf ? ` [${tf}]` : ''} state change ${previousState || 'none'} -> ${currentState}; alert blocked by cooldown`);
     }
     return false;
 }
@@ -962,9 +964,7 @@ function setupPoolConnection(index, symbols) {
                 if (!symbol) return;
                 const tf = message.res || message.type.replace('candlestick_', '');
                 const wsKey = `${symbol}_${tf}`;
-                const eventTs = Math.floor((message.ts || Date.now() * 1000) / 1000);
-                const prevTs = lastWsCandleTs.get(wsKey) || 0;
-                if (eventTs <= prevTs) return;
+                const eventTs = normalizeWsTimestamp(message.ts);
                 lastWsCandleTs.set(wsKey, eventTs);
 
                 const kline = {
@@ -973,15 +973,12 @@ function setupPoolConnection(index, symbols) {
                     h: message.h,
                     l: message.l,
                     c: message.c,
-                    v: message.v || 0,
-                    // Use message.x if provided by API, default to true for backward compatibility
-                    // This ensures we only process actual closed candles, not mid-candle updates
-                    x: message.x !== undefined ? message.x : true
+                    v: message.v || 0
                 };
 
-                if (kline.x === true) {
-                    processClosedCandle(symbol, kline, DUAL_EMA_MODE ? tf : null);
-                }
+                // Always process updates and confirm closure inside processClosedCandle.
+                // Relying on a provider-specific "x" flag causes missed closes or false positives.
+                processClosedCandle(symbol, kline, DUAL_EMA_MODE ? tf : null);
             } catch (error) {
                 log(`Error processing pool WS #${index} message: ${error.message}`, 'error');
             }
@@ -1154,7 +1151,9 @@ async function processClosedCandle(symbol, kline, tf = null) {
             return;
         }
 
-        const isNewCandle = klines.length === 0 || candleTimeMs > klines[klines.length - 1].time;
+        const hadPreviousCandle = klines.length > 0;
+        const isNewCandle = !hadPreviousCandle || candleTimeMs > klines[klines.length - 1].time;
+        const justClosedKlines = isNewCandle && hadPreviousCandle ? klines.slice() : null;
 
         // Create new kline object
         const newKline = {
@@ -1181,7 +1180,7 @@ async function processClosedCandle(symbol, kline, tf = null) {
 
         klineCache.set(cacheKey, klines);
 
-        // Get closes for EMA calculation
+        // Get closes for EMA cache updates (includes live candle)
         const closes = klines.map(k => k.close);
         const volumes = klines.map(k => k.volume);
 
@@ -1194,22 +1193,26 @@ async function processClosedCandle(symbol, kline, tf = null) {
                 ema15Cache.set(cacheKey, calculateEMA(closes, 15));
             }
 
-            const e9 = ema9Cache.get(cacheKey) || [];
-            const e15 = ema15Cache.get(cacheKey) || [];
+            // Only evaluate crossover when a candle is confirmed closed.
+            // This avoids intrabar noise and false alerts.
+            if (justClosedKlines && justClosedKlines.length >= 16) {
+                const closedCloses = justClosedKlines.map(k => k.close);
+                const closedEma9 = calculateEMA(closedCloses, 9);
+                const closedEma15 = calculateEMA(closedCloses, 15);
 
-            // Check for dual EMA crossover (EMA9 vs EMA15)
-            if (e9.length >= 2 && e15.length >= 2) {
-                // Align arrays — EMA(9) accumulates 6 more entries than EMA(15)
-                const offset = e9.length - e15.length;
-                const a9  = offset > 0 ? e9.slice(offset)  : e9;
-                const a15 = offset < 0 ? e15.slice(-offset) : e15;
+                if (closedEma9.length >= 2 && closedEma15.length >= 2) {
+                    // Align arrays — EMA(9) accumulates more entries than EMA(15)
+                    const offset = closedEma9.length - closedEma15.length;
+                    const a9  = offset > 0 ? closedEma9.slice(offset) : closedEma9;
+                    const a15 = offset < 0 ? closedEma15.slice(-offset) : closedEma15;
 
-                await checkForDualEmaCrossover(
-                    symbol,
-                    a9.at(-2), a9.at(-1),
-                    a15.at(-2), a15.at(-1),
-                    closes.at(-1), tf
-                );
+                    await checkForDualEmaCrossover(
+                        symbol,
+                        a9.at(-2), a9.at(-1),
+                        a15.at(-2), a15.at(-1),
+                        justClosedKlines.at(-1).close, tf
+                    );
+                }
             }
         } else {
             // Single EMA mode — update incrementally
@@ -1218,345 +1221,49 @@ async function processClosedCandle(symbol, kline, tf = null) {
                 const freshEma = calculateEMA(closes, EMA_PERIOD);
                 emaCache.set(symbol, freshEma);
             }
-            const emaValues = emaCache.get(symbol) || [];
 
-            // Check for price vs EMA crossover
-            if (emaValues.length >= 2) {
-                const lastPrice = closes[closes.length - 1];
-                const prevPrice = closes[closes.length - 2];
-                const lastEMA = emaValues[emaValues.length - 1];
-                const prevEMA = emaValues[emaValues.length - 2];
-                await checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA);
+            // Only evaluate crossover when a candle is confirmed closed.
+            if (justClosedKlines && justClosedKlines.length >= EMA_PERIOD + 1) {
+                const closedCloses = justClosedKlines.map(k => k.close);
+                const closedEma = calculateEMA(closedCloses, EMA_PERIOD);
+                if (closedEma.length >= 2) {
+                    const lastPrice = closedCloses.at(-1);
+                    const prevPrice = closedCloses.at(-2);
+                    const lastEMA = closedEma.at(-1);
+                    const prevEMA = closedEma.at(-2);
+                    await checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA);
+                }
             }
         }
 
         // Collect data for ML training ONLY on candle close (when a new candle bucket starts)
         // to avoid writing 100s of identical data points per candle to disk.
-        if (isNewCandle && klines.length >= 31 && ML_ENABLED && !DUAL_EMA_MODE) {
+        if (justClosedKlines && ML_ENABLED && !DUAL_EMA_MODE && mlRuntime) {
             const emaValues = emaCache.get(symbol) || [];
-            if (emaValues.length < 2) return;
-
-            // Calculate additional indicators on the PREVIOUS closed candle
-            const closedKlines = klines.slice(0, -1);
-            const closedCloses = closedKlines.map(k => k.close);
-            const closedVolumes = closedKlines.map(k => k.volume);
-            const lastClosedKline = closedKlines[closedKlines.length - 1];
-
-            if (!_indicatorsModule) _indicatorsModule = require('./src/indicators');
-            const { calculateRSI, calculateMACD, calculateBollingerBands } = _indicatorsModule;
-            const rsi = calculateRSI(closedCloses);
-            const macd = calculateMACD(closedCloses);
-            const bb = calculateBollingerBands(closedCloses);
-
-            const atr = calculateATR(closedKlines);
-            const atrValid = closedKlines.length >= 15;
-
-            const lastClosedEMA = emaValues[emaValues.length - 2];
-
-            const dataPoint = {
-                timestamp: lastClosedKline.time,
-                symbol: symbol,
-                open: lastClosedKline.open,
-                high: lastClosedKline.high,
-                low: lastClosedKline.low,
-                close: lastClosedKline.close,
-                volume: lastClosedKline.volume,
-                ema: lastClosedEMA,
-                ema_diff: ((lastClosedKline.close - lastClosedEMA) / lastClosedEMA * 100),
-                rsi: rsi[rsi.length - 1],
-                macd: macd.macd[macd.macd.length - 1],
-                macd_signal: macd.signal[macd.signal.length - 1],
-                macd_hist: macd.histogram[macd.histogram.length - 1],
-                bb_upper: bb.upper[bb.upper.length - 1],
-                bb_middle: bb.middle[bb.middle.length - 1],
-                bb_lower: bb.lower[bb.lower.length - 1],
-                bb_width: (bb.upper[bb.upper.length - 1] - bb.lower[bb.lower.length - 1]) / bb.middle[bb.middle.length - 1],
-                atr: atr,
-                atr_valid: atrValid,
-                volume_change: closedVolumes.length > 1 ? closedVolumes[closedVolumes.length - 1] / closedVolumes[closedVolumes.length - 2] - 1 : 0,
-                future_price_change: null,
-                label: null
-            };
-
-            // Store data in memory
-            if (!trainingData.has(symbol)) {
-                trainingData.set(symbol, []);
-            }
-            trainingData.get(symbol).push(dataPoint);
-
-            // Keep training data size manageable (last 1000 candles)
-            if (trainingData.get(symbol).length > 1000) {
-                trainingData.set(symbol, trainingData.get(symbol).slice(-1000));
-            }
-
-            // Fire-and-forget: don't block the candle loop, but surface disk errors
-            saveDataPoint(symbol, dataPoint).catch(e =>
-                log(`saveDataPoint failed for ${symbol}: ${e.message}`, 'error')
-            );
-
-            // Export to CSV periodically
-            if (trainingData.get(symbol).length % 10 === 0) {
-                exportToCSV(symbol);
-            }
-
-            // Schedule update of future price change (after 24 hours)
-            deferredInsert({ executeAt: Date.now() + 24 * 60 * 60 * 1000, fn: () => updateFuturePriceChange(symbol, lastClosedKline.time) });
-            // Safety cap — oldest entries are stale beyond 24 h; discard if queue grows unexpectedly
-            if (deferredUpdates.length > 5000) deferredUpdates.splice(0, deferredUpdates.length - 5000);
+            await mlRuntime.onClosedCandleForTraining(symbol, justClosedKlines, emaValues, deferredInsert, deferredUpdates);
         }
     } catch (error) {
         log(`Error processing closed candle for ${symbol}: ${error.message}`, 'error');
     }
 }
 
-// Save data point to JSON file
-async function saveDataPoint(symbol, dataPoint) {
-    try {
-        const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
-        const symbolDir = path.join(ML_DATA_DIR, safeSymbol);
-
-        // Use current month for filename to organize data.
-        // Write as NDJSON (one JSON object per line) so each candle is a single
-        // async append — no read-modify-write cycle, no blocking existsSync.
-        const date = new Date();
-        const filename = `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}.ndjson`;
-        const filePath = path.join(symbolDir, filename);
-
-        // Dir is pre-created at WebSocket setup time (setupPooledWebSockets) but
-        // we create it defensively here in case ML was enabled after initial setup.
-        await fs.promises.mkdir(symbolDir, { recursive: true });
-        await fs.promises.appendFile(filePath, JSON.stringify(dataPoint) + '\n');
-
-        return true;
-    } catch (error) {
-        log(`Error saving data point for ${symbol}: ${error.message}`, 'error');
-        return false;
-    }
-}
-
-// Export training data to CSV for easier model training
-// Cache one CsvWriter instance per file path — avoids reallocating on every candle close
-const csvWriterCache = new Map();
-function getCsvWriter(csvPath) {
-    if (!csvWriterCache.has(csvPath)) {
-        csvWriterCache.set(csvPath, createObjectCsvWriter({
-            path: csvPath,
-            header: [
-                { id: 'timestamp', title: 'TIMESTAMP' },
-                { id: 'symbol', title: 'SYMBOL' },
-                { id: 'open', title: 'OPEN' },
-                { id: 'high', title: 'HIGH' },
-                { id: 'low', title: 'LOW' },
-                { id: 'close', title: 'CLOSE' },
-                { id: 'volume', title: 'VOLUME' },
-                { id: 'ema', title: 'EMA' },
-                { id: 'ema_diff', title: 'EMA_DIFF' },
-                { id: 'rsi', title: 'RSI' },
-                { id: 'macd', title: 'MACD' },
-                { id: 'macd_signal', title: 'MACD_SIGNAL' },
-                { id: 'macd_hist', title: 'MACD_HIST' },
-                { id: 'bb_upper', title: 'BB_UPPER' },
-                { id: 'bb_middle', title: 'BB_MIDDLE' },
-                { id: 'bb_lower', title: 'BB_LOWER' },
-                { id: 'bb_width', title: 'BB_WIDTH' },
-                { id: 'atr', title: 'ATR' },
-                { id: 'atr_valid', title: 'ATR_VALID' },
-                { id: 'volume_change', title: 'VOLUME_CHANGE' },
-                { id: 'future_price_change', title: 'FUTURE_PRICE_CHANGE' },
-                { id: 'label', title: 'LABEL' }
-            ]
-        }));
-    }
-    return csvWriterCache.get(csvPath);
-}
-
 function exportToCSV(symbol) {
-    try {
-        if (!trainingData.has(symbol) || trainingData.get(symbol).length === 0) {
-            return;
-        }
-
-        const data = trainingData.get(symbol);
-        const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
-
-        // Create directory for this symbol if it doesn't exist
-        const symbolDir = path.join(CSV_DATA_DIR, safeSymbol);
-        if (!fs.existsSync(symbolDir)) {
-            fs.mkdirSync(symbolDir, { recursive: true });
-        }
-
-        // Create CSV file path
-        const csvPath = path.join(symbolDir, `${safeSymbol}_training_data.csv`);
-
-        // Define CSV writer (cached per path — avoids re-allocation on every call)
-        const csvWriter = getCsvWriter(csvPath);
-
-        // Write data to CSV
-        csvWriter.writeRecords(data)
-            .then(() => {
-                log(`CSV export completed for ${symbol} with ${data.length} records`, 'success');
-            })
-            .catch(error => {
-                log(`Error writing CSV for ${symbol}: ${error.message}`, 'error');
-            });
-    } catch (error) {
-        log(`Error exporting to CSV for ${symbol}: ${error.message}`, 'error');
-    }
+    if (mlRuntime) mlRuntime.exportToCSV(symbol);
 }
 
 // Export all training data to CSV
 function exportAllDataToCSV() {
-    try {
-        log('Exporting all training data to CSV...', 'info');
-
-        for (const [symbol, data] of trainingData.entries()) {
-            if (data.length > 0) {
-                exportToCSV(symbol);
-            }
-        }
-
-        log('All training data exported to CSV successfully', 'success');
-    } catch (error) {
-        log(`Error exporting all data to CSV: ${error.message}`, 'error');
-    }
-}
-
-
-// // Process real-time candle updates
-// function processRealtimeCandle(symbol, kline, logUnconfirmed = true) {
-//     try {
-//         // Get cached klines
-//         const klines = klineCache.get(symbol);
-//         if (!klines || klines.length === 0) {
-//             return; // No historical data yet
-//         }
-
-//         // Get current price
-//         const currentPrice = parseFloat(kline.c);
-
-//         // Get cached EMA values
-//         const emaValues = emaCache.get(symbol);
-//         if (!emaValues || emaValues.length < 2) {
-//             return; // Not enough EMA values yet
-//         }
-
-//         // Get the last closed price and EMA
-//         const lastClosedPrice = klines[klines.length - 1].close;
-//         const lastEMA = emaValues[emaValues.length - 1];
-
-//         // Determine current state (above or below EMA)
-//         const prevState = lastClosedPrice > lastEMA ? 'above' : 'below';
-//         const currentState = currentPrice > lastEMA ? 'above' : 'below';
-
-//         // If state changed, we have a potential real-time crossover
-//         if (prevState !== currentState) {
-//             // Calculate difference percentage
-//             const difference = (currentPrice - lastEMA) / lastEMA * 100;
-
-//             // Only log if explicitly requested (for debugging)
-//             if (logUnconfirmed) {
-//                 // Log the potential crossover but don't send alert yet
-//                 console.log('\n');
-//                 const crossType = currentState === 'above' ? 'up' : 'down';
-//                 const crossLabel = crossType === 'up' ?
-//                     '▲'.yellow + ' POTENTIAL UPWARD CROSSOVER '.black.bgYellow :
-//                     '▼'.yellow + ' POTENTIAL DOWNWARD CROSSOVER '.black.bgYellow;
-
-//                 console.log(crossLabel + ' ' + symbol.bold);
-//                 console.log(`  Current Price: ${formatPrice(currentPrice)[crossType === 'up' ? 'green' : 'red']}`);
-//                 console.log(`  EMA(${EMA_PERIOD}): ${formatPrice(lastEMA).cyan}`);
-//                 console.log(`  Difference: ${difference.toFixed(2)}%`.yellow);
-//                 console.log(`  Status: ${'REAL-TIME (Unconfirmed)'.yellow}`);
-//             }
-
-//             // Only log to file, not to console
-//             fs.appendFileSync(
-//                 getDailyLogPath(),
-//                 `[${new Date().toISOString()}] Potential ${currentState === 'above' ? 'upward' : 'downward'} crossover detected for ${symbol} (unconfirmed)\n`
-//             );
-//         }
-//     } catch (error) {
-//         // Only log to file, not to console
-//         fs.appendFileSync(
-//             getDailyLogPath(),
-//             `[${new Date().toISOString()}] Error processing real-time candle for ${symbol}: ${error.message}\n`
-//         );
-//     }
-// }
-
-// Function to update future price change for training data
-async function updateFuturePriceChange(symbol, timestamp) {
-    try {
-        if (!trainingData.has(symbol)) return;
-
-        const data = trainingData.get(symbol);
-        const dataPoint = data.find(d => d.timestamp === timestamp);
-
-        if (!dataPoint) return;
-
-        // Get current price
-        const currentPrice = await getCurrentPrice(symbol);
-        const originalPrice = dataPoint.close;
-
-        // Calculate price change percentage
-        const priceChange = ((currentPrice - originalPrice) / originalPrice * 100);
-
-        // Update the data point
-        dataPoint.future_price_change = priceChange;
-        // 3-class label: 0 = bearish (<-1%), 1 = neutral, 2 = bullish (>+1%)
-        const LABEL_THRESHOLD = 1.0;
-        dataPoint.label = priceChange > LABEL_THRESHOLD ? 2 : priceChange < -LABEL_THRESHOLD ? 0 : 1;
-        log(`Updated future price change for ${symbol}: ${priceChange.toFixed(2)}%`, 'info');
-
-        // Update the data in JSON files
-        updateStoredDataPoint(symbol, timestamp, priceChange);
-
-        // Update CSV file
-        exportToCSV(symbol);
-    } catch (error) {
-        log(`Error updating future price change: ${error.message}`, 'error');
-    }
-}
-
-// Update a stored data point — append-only to a tiny labels file.
-// The main NDJSON data file is never read or rewritten, keeping O(1) I/O
-// regardless of how many data points the symbol has accumulated.
-async function updateStoredDataPoint(symbol, timestamp, priceChange) {
-    try {
-        const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
-        const symbolDir = path.join(ML_DATA_DIR, safeSymbol);
-        if (!fs.existsSync(symbolDir)) return false;
-
-        const label = priceChange > 1.0 ? 2 : priceChange < -1.0 ? 0 : 1;
-        const labelsPath = path.join(symbolDir, 'labels.ndjson');
-        await fs.promises.appendFile(
-            labelsPath,
-            JSON.stringify({ timestamp, future_price_change: priceChange, label }) + '\n'
-        );
-        return true;
-    } catch (error) {
-        log(`Error updating stored data point for ${symbol}: ${error.message}`, 'error');
-        return false;
-    }
-}
-
-// Function to get current price
-async function getCurrentPrice(symbol) {
-    try {
-        await enforceRateLimit();
-        const response = await axios.get(`${DELTA_REST_BASE_URL}/tickers/${symbol}`, {
-            timeout: 10000
-        });
-        return parseFloat(response?.data?.result?.close || 0);
-    } catch (error) {
-        log(`Error getting current price for ${symbol}: ${error.message}`, 'error');
-        throw error;
-    }
+    if (mlRuntime) mlRuntime.exportAllDataToCSV();
 }
 
 // Check for crossover and send alerts if needed with ML prediction
 async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA) {
     try {
+        if (![prevPrice, lastPrice, prevEMA, lastEMA].every(Number.isFinite) || prevEMA === 0 || lastEMA === 0) {
+            traceAlert(`${symbol} single-mode skipped: invalid numeric inputs`);
+            return;
+        }
+
         // Determine current state (above or below EMA)
         const currentState = lastPrice > lastEMA ? 'above' : 'below';
         const difference = (lastPrice - lastEMA) / lastEMA * 100;
@@ -1574,6 +1281,7 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
 
         // Upward crossover: price crossing from below to above EMA (with minimum margin)
         if (prevPrice < prevEMA && lastPrice > lastEMA && (lastPrice - lastEMA) / lastEMA > MIN_CROSS_PCT) {
+            traceAlert(`${symbol} single-mode bullish candidate diff=${difference.toFixed(4)}%`);
             console.log('\n');
             console.log('▲'.green + ' UPWARD CROSSOVER '.white.bgGreen + ' ' + symbol.bold);
             console.log(`  Previous Price: ${formatPrice(prevPrice).gray} → Current Price: ${formatPrice(lastPrice).green}`);
@@ -1591,6 +1299,7 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
                 // Update state so next real crossover is detected, but don't consume cooldown
                 coinStates.set(symbol, currentState);
                 console.log(`  ⏸️  Alert suppressed: ${flatCheck.reason}`.gray);
+                traceAlert(`${symbol} single-mode bullish suppressed: ${flatCheck.reason}`);
                 return;
             }
 
@@ -1600,10 +1309,12 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
                 } else {
                     await sendTelegramAlert(symbol, 'up', lastPrice, lastEMA, difference);
                 }
+                traceAlert(`${symbol} single-mode bullish alert emitted`);
             }
         }
         // Downward crossover: price crossing from above to below EMA (with minimum margin)
         else if (prevPrice > prevEMA && lastPrice < lastEMA && (lastEMA - lastPrice) / lastEMA > MIN_CROSS_PCT) {
+            traceAlert(`${symbol} single-mode bearish candidate diff=${difference.toFixed(4)}%`);
             console.log('\n');
             console.log('▼'.red + ' DOWNWARD CROSSOVER '.white.bgRed + ' ' + symbol.bold);
             console.log(`  Previous Price: ${formatPrice(prevPrice).gray} → Current Price: ${formatPrice(lastPrice).red}`);
@@ -1621,6 +1332,7 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
                 // Update state so next real crossover is detected, but don't consume cooldown
                 coinStates.set(symbol, currentState);
                 console.log(`  ⏸️  Alert suppressed: ${flatCheck.reason}`.gray);
+                traceAlert(`${symbol} single-mode bearish suppressed: ${flatCheck.reason}`);
                 return;
             }
 
@@ -1630,10 +1342,12 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
                 } else {
                     await sendTelegramAlert(symbol, 'down', lastPrice, lastEMA, difference);
                 }
+                traceAlert(`${symbol} single-mode bearish alert emitted`);
             }
         } else {
             // Update state even if no crossover
             coinStates.set(symbol, currentState);
+            traceAlert(`${symbol} single-mode no cross; state=${currentState} diff=${difference.toFixed(4)}%`);
         }
     } catch (error) {
         log(`Error checking for crossover for ${symbol}: ${error.message}`, 'error');
@@ -1644,6 +1358,11 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
 // tf — '5m' or '15m' in dual-TF mode; '' in legacy single-TF mode
 async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, lastEma15, currentPrice, tf = '') {
     try {
+        if (![prevEma9, lastEma9, prevEma15, lastEma15].every(Number.isFinite) || prevEma15 === 0 || lastEma15 === 0) {
+            traceAlert(`${symbol}${tf ? ` [${tf}]` : ''} dual-mode skipped: invalid numeric inputs`);
+            return;
+        }
+
         // State: is EMA(9) above or below EMA(15)?
         const currentState = lastEma9 > lastEma15 ? 'ema9_above' : 'ema9_below';
         const difference = (lastEma9 - lastEma15) / lastEma15 * 100;
@@ -1651,6 +1370,7 @@ async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, l
 
         // Bullish: EMA(9) crosses above EMA(15) (with minimum margin)
         if (prevEma9 < prevEma15 && lastEma9 > lastEma15 && (lastEma9 - lastEma15) / lastEma15 > MIN_CROSS_PCT) {
+            traceAlert(`${symbol}${tf ? ` [${tf}]` : ''} dual bullish candidate spread=${difference.toFixed(4)}%`);
             console.log('\n');
             console.log('▲'.green + ` EMA 9/15 BULLISH CROSSOVER${tfTag} `.white.bgGreen + ' ' + symbol.bold);
             console.log(`  EMA(9): ${formatPrice(prevEma9).gray} → ${formatPrice(lastEma9).green}`);
@@ -1666,15 +1386,18 @@ async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, l
                 // Update state so next real crossover is detected, but don't consume cooldown
                 coinStates.set(stateKey, currentState);
                 console.log(`  ⏸️  Alert suppressed: ${flatCheck.reason}`.gray);
+                traceAlert(`${symbol}${tf ? ` [${tf}]` : ''} dual bullish suppressed: ${flatCheck.reason}`);
                 return;
             }
 
             if (shouldAlert(symbol, currentState, tf)) {
                 await sendDualEmaAlert(symbol, 'up', currentPrice, lastEma9, lastEma15, difference, tf);
+                traceAlert(`${symbol}${tf ? ` [${tf}]` : ''} dual bullish alert emitted`);
             }
         }
         // Bearish: EMA(9) crosses below EMA(15) (with minimum margin)
         else if (prevEma9 > prevEma15 && lastEma9 < lastEma15 && (lastEma15 - lastEma9) / lastEma15 > MIN_CROSS_PCT) {
+            traceAlert(`${symbol}${tf ? ` [${tf}]` : ''} dual bearish candidate spread=${difference.toFixed(4)}%`);
             console.log('\n');
             console.log('▼'.red + ` EMA 9/15 BEARISH CROSSOVER${tfTag} `.white.bgRed + ' ' + symbol.bold);
             console.log(`  EMA(9): ${formatPrice(prevEma9).gray} → ${formatPrice(lastEma9).red}`);
@@ -1690,16 +1413,19 @@ async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, l
                 // Update state so next real crossover is detected, but don't consume cooldown
                 coinStates.set(stateKey, currentState);
                 console.log(`  ⏸️  Alert suppressed: ${flatCheck.reason}`.gray);
+                traceAlert(`${symbol}${tf ? ` [${tf}]` : ''} dual bearish suppressed: ${flatCheck.reason}`);
                 return;
             }
 
             if (shouldAlert(symbol, currentState, tf)) {
                 await sendDualEmaAlert(symbol, 'down', currentPrice, lastEma9, lastEma15, difference, tf);
+                traceAlert(`${symbol}${tf ? ` [${tf}]` : ''} dual bearish alert emitted`);
             }
         } else {
             // No crossover — update tracked state so future crossovers are detected
             const stateKey = tf ? tfKey(symbol, tf) : symbol;
             coinStates.set(stateKey, currentState);
+            traceAlert(`${symbol}${tf ? ` [${tf}]` : ''} dual no cross; state=${currentState} spread=${difference.toFixed(4)}%`);
         }
     } catch (error) {
         log(`Error checking dual EMA crossover for ${symbol}: ${error.message}`, 'error');
@@ -1768,102 +1494,14 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, t
 
 // Function to make price movement prediction
 async function predictPriceMovement(symbol, price, ema, emaDiff) {
-    try {
-        if (!ML_ENABLED) return null;
-
-        // Get the ML model module
-        const mlModel = require('./src/ml/model');
-
-        // In dual mode klines are stored under the TF-keyed cache (e.g. "BTCUSDT_15m").
-        // Using the flat symbol would always return undefined → prediction silently disabled.
-        // 15m is preferred as the ML feature source — more signal than 5m noise.
-        const mlCacheKey = DUAL_EMA_MODE ? tfKey(symbol, '15m') : symbol;
-        const klines = klineCache.get(mlCacheKey) || [];
-        if (klines.length < 30) return null;
-
-        const closes = klines.map(k => k.close);
-        const volumes = klines.map(k => k.volume || 0);
-
-        // Calculate indicators
-        const { calculateRSI, calculateMACD, calculateBollingerBands } = require('./src/indicators');
-        const rsi = calculateRSI(closes);
-        const macd = calculateMACD(closes);
-        const bb = calculateBollingerBands(closes);
-        const atr = calculateATR(klines);
-
-        // Create feature object for prediction
-        const features = {
-            priceDiff: emaDiff,
-            volume24h: volumes[volumes.length - 1],
-            volumeChange: volumes[volumes.length - 1] / volumes[volumes.length - 2] - 1,
-            relativeVolume: volumes[volumes.length - 1] / volumes.slice(-10).reduce((sum, vol) => sum + vol, 0) * 10,
-            atr: atr || 0,
-            bbWidth: (bb.upper[bb.upper.length - 1] - bb.lower[bb.lower.length - 1]) / bb.middle[bb.middle.length - 1],
-            rsi: rsi[rsi.length - 1],
-            macdHist: macd.histogram[macd.histogram.length - 1]
-        };
-
-        // Make prediction
-        const prediction = await mlModel.predictPriceChange(symbol, features);
-
-        // Update model performance tracking
-        if (prediction !== null) {
-            if (!modelPerformance.has(symbol)) {
-                modelPerformance.set(symbol, {
-                    predictions: 1,
-                    correctPredictions: 0,
-                    accuracy: 0,
-                    lastTraining: '',
-                    dataPoints: 0
-                });
-            } else {
-                const perf = modelPerformance.get(symbol);
-                perf.predictions++;
-                modelPerformance.set(symbol, perf);
-            }
-
-            // Schedule accuracy update
-            deferredInsert({ executeAt: Date.now() + 24 * 60 * 60 * 1000, fn: () => updateModelAccuracy(symbol, price, prediction) });
-            // Safety cap — mirrors the cap in processClosedCandle
-            if (deferredUpdates.length > 5000) deferredUpdates.splice(0, deferredUpdates.length - 5000);
-        }
-
-        return prediction;
-    } catch (error) {
-        log(`Error predicting price movement for ${symbol}: ${error.message}`, 'error');
-        return null;
-    }
+    if (!mlRuntime || !ML_ENABLED) return null;
+    return mlRuntime.predictPriceMovement(symbol, price, ema, emaDiff, deferredInsert, deferredUpdates);
 }
 
 // Update model accuracy after 24 hours
 async function updateModelAccuracy(symbol, originalPrice, prediction) {
-    try {
-        // Get current price
-        const currentPrice = await getCurrentPrice(symbol);
-
-        // Calculate actual price change
-        const actualChange = ((currentPrice - originalPrice) / originalPrice * 100);
-
-        // Determine if prediction was correct (same direction)
-        const predictionCorrect = (prediction > 0 && actualChange > 0) || (prediction < 0 && actualChange < 0);
-
-        // Update model performance
-        if (modelPerformance.has(symbol)) {
-            const perf = modelPerformance.get(symbol);
-            if (predictionCorrect) {
-                perf.correctPredictions++;
-            }
-            perf.accuracy = perf.correctPredictions / perf.predictions;
-            modelPerformance.set(symbol, perf);
-
-            log(`Updated model accuracy for ${symbol}: ${(perf.accuracy * 100).toFixed(2)}% (${perf.correctPredictions}/${perf.predictions})`, 'info');
-        }
-
-        // Save performance data
-        saveTrainingData();
-    } catch (error) {
-        log(`Error updating model accuracy for ${symbol}: ${error.message}`, 'error');
-    }
+    // Handled inside ML runtime; retained for backward compatibility.
+    return;
 }
 
 // Setup WebSockets for all tracked pairs
@@ -1885,10 +1523,6 @@ async function setupAllWebSockets() {
                     `[${new Date().toISOString()}] Cleaning caches for ${symbol} (no longer tracked)\n`
                 );
                 trackedPairs.delete(symbol);
-
-                const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
-                const csvPath = path.join(CSV_DATA_DIR, safeSymbol, `${safeSymbol}_training_data.csv`);
-                csvWriterCache.delete(csvPath);
 
                 const tfKeysToClear = new Set(['5m', '15m', ...getDualEmaTimeframes()]);
                 const cacheKeysToClear = [symbol, ...Array.from(tfKeysToClear).map(tf => tfKey(symbol, tf))];
@@ -1948,7 +1582,7 @@ async function fetchInChunks(factories, chunkSize = 8, delayMs = 1500) {
 // The flat EMA check (synchronous in isEmaFlat) does not eliminate this window — both chains can still
 // pass the filter and race into shouldAlert(). This is a known architectural limitation.
 // Mitigation: ALERT_COOLDOWN prevents immediate duplicate alerts, but very rare duplicates may still occur.
-async function checkEMACross() {
+async function checkEMACross({ emitAlerts = false } = {}) {
     try {
         const pairs = await getFuturesPairs();
         const timestamp = new Date().toLocaleString();
@@ -2014,12 +1648,16 @@ async function checkEMACross() {
                 const a15 = _offset < 0 ? e15.slice(-_offset) : e15;
 
                 const closes = klines.map(k => k.close);
-                await checkForDualEmaCrossover(
-                    pair,
-                    a9.at(-2), a9.at(-1),
-                    a15.at(-2), a15.at(-1),
-                    closes.at(-1), tf
-                );
+                if (emitAlerts) {
+                    await checkForDualEmaCrossover(
+                        pair,
+                        a9.at(-2), a9.at(-1),
+                        a15.at(-2), a15.at(-1),
+                        closes.at(-1), tf
+                    );
+                } else {
+                    coinStates.set(tfKey(pair, tf), a9.at(-1) > a15.at(-1) ? 'ema9_above' : 'ema9_below');
+                }
             } else {
                 // Single EMA crossover check (price vs EMA)
                 const closes = klines.map(k => k.close);
@@ -2035,7 +1673,11 @@ async function checkEMACross() {
                 const prevPrice = closes[closes.length - 2];
                 const prevEMA = ema[ema.length - 2];
 
-                await checkForCrossover(pair, prevPrice, lastPrice, prevEMA, lastEMA);
+                if (emitAlerts) {
+                    await checkForCrossover(pair, prevPrice, lastPrice, prevEMA, lastEMA);
+                } else {
+                    coinStates.set(pair, lastPrice > lastEMA ? 'above' : 'below');
+                }
             }
         }
 
@@ -2050,206 +1692,17 @@ async function checkEMACross() {
 
 // Save training data to disk (both JSON and CSV)
 function saveTrainingData() {
-    try {
-        // NDJSON files are the append-only source of truth — no full JSON rewrite needed.
-        // Just refresh CSV snapshots and persist model performance metadata.
-        for (const symbol of trainingData.keys()) {
-            exportToCSV(symbol);
-        }
-
-        // Save model performance data
-        const perfPath = path.join(ML_DATA_DIR, 'model_performance.json');
-        fs.writeFile(perfPath, JSON.stringify(Array.from(modelPerformance.entries()), null, 2),
-            (err) => { if (err) log(`Error writing model performance data: ${err.message}`, 'error'); }
-        );
-
-        log(`Saved training data for ${trainingData.size} symbols`, 'success');
-    } catch (error) {
-        log(`Error saving training data: ${error.message}`, 'error');
-    }
+    if (mlRuntime) mlRuntime.saveTrainingData();
 }
 
 // Load training data from disk
 function loadTrainingData() {
-    try {
-        log('Loading training data...', 'info');
-
-        if (!fs.existsSync(ML_DATA_DIR)) {
-            fs.mkdirSync(ML_DATA_DIR, { recursive: true });
-            log('Created ML data directory', 'info');
-            return;
-        }
-
-        // Get all symbol directories
-        const symbols = fs.readdirSync(ML_DATA_DIR)
-            .filter(item => fs.statSync(path.join(ML_DATA_DIR, item)).isDirectory());
-
-        for (const symbol of symbols) {
-            const symbolDir = path.join(ML_DATA_DIR, symbol);
-            const files = fs.readdirSync(symbolDir).filter(f => f.endsWith('.json') || f.endsWith('.ndjson'));
-
-            let symbolData = [];
-
-            for (const file of files) {
-                try {
-                    const filePath = path.join(symbolDir, file);
-                    let fileData;
-                    if (file.endsWith('.ndjson')) {
-                        fileData = fs.readFileSync(filePath, 'utf8')
-                            .split('\n')
-                            .filter(Boolean)
-                            .map(line => JSON.parse(line));
-                    } else {
-                        fileData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-                    }
-                    symbolData = symbolData.concat(fileData);
-                } catch (error) {
-                    log(`Error loading data file ${file} for ${symbol}: ${error.message}`, 'warning');
-                }
-            }
-
-            if (symbolData.length > 0) {
-                // Apply persisted labels (future_price_change) written by the deferred queue.
-                // Last label entry per timestamp wins (handles multiple updates to same point).
-                const labelsPath = path.join(symbolDir, 'labels.ndjson');
-                if (fs.existsSync(labelsPath)) {
-                    try {
-                        const lblMap = new Map(
-                            fs.readFileSync(labelsPath, 'utf8')
-                                .split('\n').filter(Boolean)
-                                .map(l => JSON.parse(l))
-                                .map(l => [l.timestamp, l])
-                        );
-                        for (const d of symbolData) {
-                            const lbl = lblMap.get(d.timestamp);
-                            if (lbl) {
-                                d.future_price_change = lbl.future_price_change;
-                                d.label = lbl.label;
-                            }
-                        }
-                    } catch (e) {
-                        log(`Error loading labels for ${symbol}: ${e.message}`, 'warning');
-                    }
-                }
-                trainingData.set(symbol, symbolData);
-                log(`Loaded ${symbolData.length} data points for ${symbol}`, 'info');
-            }
-        }
-
-        // Load model performance data
-        const perfPath = path.join(ML_DATA_DIR, 'model_performance.json');
-        if (fs.existsSync(perfPath)) {
-            try {
-                const perfData = JSON.parse(fs.readFileSync(perfPath, 'utf8'));
-                for (const [symbol, data] of perfData) {
-                    modelPerformance.set(symbol, data);
-                }
-                log(`Loaded performance data for ${modelPerformance.size} models`, 'info');
-            } catch (error) {
-                log(`Error loading model performance data: ${error.message}`, 'warning');
-            }
-        }
-
-        log(`Loaded training data for ${trainingData.size} symbols`, 'success');
-    } catch (error) {
-        log(`Error loading training data: ${error.message}`, 'error');
-    }
+    if (mlRuntime) mlRuntime.loadTrainingData();
 }
 
 // Function to train all models
 async function trainAllModels(chatId) {
-    try {
-        await bot.sendMessage(chatId, '🧠 Starting model training. This may take some time...');
-
-        // Get all symbols with sufficient data
-        const symbolsToTrain = Array.from(trainingData.keys())
-            .filter(symbol => {
-                const data = trainingData.get(symbol);
-                // Only use data points with future price change values
-                const validData = data.filter(d => d.future_price_change !== null);
-                return validData.length >= 100;
-            });
-
-        if (symbolsToTrain.length === 0) {
-            await bot.sendMessage(chatId, '❌ No symbols have enough data for training yet.');
-            return;
-        }
-
-        await bot.sendMessage(chatId, `Training models for ${symbolsToTrain.length} symbols...`);
-
-        let trainedCount = 0;
-        let failedCount = 0;
-
-        // Train models sequentially
-        for (const symbol of symbolsToTrain) {
-            try {
-                const { trainModelForSymbol } = require('./src/ml/model');
-
-                // Filter data to only include points with future price change
-                const allData = trainingData.get(symbol);
-                const validData = allData.filter(d => d.future_price_change !== null);
-
-                if (validData.length < 100) {
-                    log(`Not enough valid data points for ${symbol}: ${validData.length}`, 'warning');
-                    failedCount++;
-                    continue;
-                }
-
-                const result = await trainModelForSymbol(symbol);
-
-                if (result) {
-                    trainedCount++;
-
-                    // Update model performance tracking
-                    if (!modelPerformance.has(symbol)) {
-                        modelPerformance.set(symbol, {
-                            predictions: 0,
-                            correctPredictions: 0,
-                            accuracy: 0,
-                            lastTraining: new Date().toISOString(),
-                            dataPoints: validData.length
-                        });
-                    } else {
-                        const perf = modelPerformance.get(symbol);
-                        perf.lastTraining = new Date().toISOString();
-                        perf.dataPoints = validData.length;
-                        modelPerformance.set(symbol, perf);
-                    }
-
-                    // Send progress updates every 5 models
-                    if (trainedCount % 5 === 0) {
-                        await bot.sendMessage(
-                            chatId,
-                            `Progress: ${trainedCount}/${symbolsToTrain.length} models trained`
-                        );
-                    }
-                } else {
-                    failedCount++;
-                }
-
-                // Add a small delay between training sessions
-                await new Promise(resolve => setTimeout(resolve, 5000));
-            } catch (error) {
-                log(`Error training model for ${symbol}: ${error.message}`, 'error');
-                failedCount++;
-            }
-        }
-
-        // Save updated model performance data
-        saveTrainingData();
-
-        await bot.sendMessage(
-            chatId,
-            `🧠 *ML Training Complete*\n\n` +
-            `✅ Successfully trained: ${trainedCount} models\n` +
-            `❌ Failed: ${failedCount} models\n\n` +
-            `Use /mlstatus to check model performance.`,
-            { parse_mode: 'Markdown' }
-        );
-    } catch (error) {
-        log(`Error in trainAllModels: ${error.message}`, 'error');
-        await bot.sendMessage(chatId, `❌ Error training models: ${error.message}`);
-    }
+    if (mlRuntime) await mlRuntime.trainAllModels(chatId);
 }
 
 // Enhanced Telegram alert with ML confidence
@@ -2369,99 +1822,7 @@ async function handleMessage(msg) {
 
 // Function to manually collect data for all tracked pairs
 async function startManualDataCollection(chatId) {
-    try {
-        await bot.sendMessage(chatId, '📊 Starting manual data collection for all tracked pairs...');
-
-        const pairs = await getFuturesPairs();
-        if (pairs.length === 0) {
-            await bot.sendMessage(chatId, '❌ No pairs are currently being tracked.');
-            return;
-        }
-
-        await bot.sendMessage(chatId, `Collecting data for ${pairs.length} pairs...`);
-
-        let successCount = 0;
-        let failedCount = 0;
-
-        for (const symbol of pairs) {
-            try {
-                // In dual mode, pre-seed the 5m EMA + kline cache via a REST call so
-                // selected dual-timeframe buckets are ready immediately.
-                if (DUAL_EMA_MODE) {
-                    for (const tf of getDualEmaTimeframes()) {
-                        await getKlines(symbol, tf);
-                    }
-                }
-
-                // Use default klines in single mode; in dual mode replay 15m cache for training compatibility.
-                const klines = await getKlines(symbol, DUAL_EMA_MODE ? '15m' : null);
-                if (klines.length < 30) {
-                    log(`Skipping ${symbol}: Not enough candles`, 'warning');
-                    failedCount++;
-                    continue;
-                }
-
-                // Process each candle
-                for (let i = 0; i < klines.length; i++) {
-                    // Skip very old candles
-                    if (i < klines.length - 100) continue;
-
-                    const candle = klines[i];
-
-                    // Create kline object in the format expected by processClosedCandle
-                    const klineObj = {
-                        t: candle.time,
-                        o: candle.open.toString(),
-                        h: candle.high.toString(),
-                        l: candle.low.toString(),
-                        c: candle.close.toString(),
-                        v: candle.volume.toString()
-                    };
-
-                    // Process this candle — pass tf so dual mode writes to the correct cache key
-                    // (symbol_15m) rather than the flat (symbol) bucket
-                    const replayTf = DUAL_EMA_MODE ? '15m' : null;
-                    await processClosedCandle(symbol, klineObj, replayTf);
-                }
-
-                successCount++;
-
-                // Send progress updates
-                if ((successCount + failedCount) % 10 === 0) {
-                    await bot.sendMessage(
-                        chatId,
-                        `Progress: ${successCount + failedCount}/${pairs.length} pairs processed`
-                    );
-                }
-
-                // Add a small delay to avoid rate limiting
-                await new Promise(resolve => setTimeout(resolve, 500));
-            } catch (error) {
-                log(`Error collecting data for ${symbol}: ${error.message}`, 'error');
-                failedCount++;
-            }
-        }
-
-        // Save all collected data
-        saveTrainingData();
-
-        // Export to CSV
-        exportAllDataToCSV();
-
-        // Send completion message
-        await bot.sendMessage(
-            chatId,
-            `📊 *Data Collection Complete*\n\n` +
-            `✅ Successfully collected data for ${successCount} pairs\n` +
-            `❌ Failed: ${failedCount} pairs\n\n` +
-            `Future price changes will be updated in 24 hours.\n` +
-            `Data has been exported to CSV format for easier analysis.`,
-            { parse_mode: 'Markdown' }
-        );
-    } catch (error) {
-        log(`Error in manual data collection: ${error.message}`, 'error');
-        await bot.sendMessage(chatId, `❌ Error during data collection: ${error.message}`);
-    }
+    if (mlRuntime) await mlRuntime.startManualDataCollection(chatId);
 }
 
 // Graceful WebSocket reconnect — closes all connections, waits 30 s, then reconnects
@@ -2927,68 +2288,7 @@ async function sendTopPerformers(chatId, type = 'gainers') {
 
 // Add a command to check model performance
 async function sendModelPerformance(chatId) {
-    try {
-        if (modelPerformance.size === 0) {
-            await bot.sendMessage(chatId, '❌ No model performance data available yet.');
-            return;
-        }
-
-        let message = '*ML Model Performance*\n\n';
-
-        // Sort symbols by accuracy
-        const sortedSymbols = Array.from(modelPerformance.keys())
-            .sort((a, b) => {
-                const aMetrics = modelPerformance.get(a);
-                const bMetrics = modelPerformance.get(b);
-                return (bMetrics.accuracy || 0) - (aMetrics.accuracy || 0);
-            })
-            .slice(0, 10); // Top 10 performing models
-
-        for (const symbol of sortedSymbols) {
-            const metrics = modelPerformance.get(symbol);
-            if (!metrics || metrics.predictions < 10) continue; // Skip models with few predictions
-
-            message += `*${symbol}*\n` +
-                `- Overall Accuracy: ${((metrics.accuracy || 0) * 100).toFixed(2)}%\n` +
-                `- Total Predictions: ${metrics.predictions || 0}\n` +
-                `- Data Points: ${metrics.dataPoints || 0}\n` +
-                `- Last Trained: ${metrics.lastTraining ? new Date(metrics.lastTraining).toLocaleString() : 'Unknown'}\n\n`;
-        }
-
-        // Add summary statistics
-        const totalModels = modelPerformance.size;
-        const totalPredictions = Array.from(modelPerformance.values())
-            .reduce((sum, metrics) => sum + (metrics.predictions || 0), 0);
-        // Only include models with enough predictions to be meaningful.
-        // Guard against empty set — no qualifying models → show 0% rather than NaN.
-        const qualifiedModels = Array.from(modelPerformance.values())
-            .filter(metrics => metrics.predictions >= 10);
-        const avgAccuracy = qualifiedModels.length > 0
-            ? qualifiedModels.reduce((sum, m) => sum + (m.accuracy || 0), 0) / qualifiedModels.length
-            : 0;
-
-        message += `*Summary Statistics*\n` +
-            `- Total Models: ${totalModels}\n` +
-            `- Total Predictions: ${totalPredictions}\n` +
-            `- Average Accuracy: ${(avgAccuracy * 100).toFixed(2)}%\n\n` +
-            `Use /train to train all models or /collectdata to gather more training data.`;
-
-        await bot.sendMessage(chatId, message, {
-            parse_mode: 'Markdown',
-            reply_markup: {
-                inline_keyboard: [
-                    [
-                        { text: '🧠 Train Models', callback_data: 'train_models' },
-                        { text: '📊 Export Data', callback_data: 'export_csv' }
-                    ],
-                    [{ text: '🔙 Back to Menu', callback_data: 'menu' }]
-                ]
-            }
-        });
-    } catch (error) {
-        log(`Error sending model performance: ${error.message}`, 'error');
-        await bot.sendMessage(chatId, '❌ Error fetching model performance data');
-    }
+    if (mlRuntime) await mlRuntime.sendModelPerformance(chatId);
 }
 
 // Send initial startup message to Telegram
@@ -3080,101 +2380,7 @@ function startWebSocketHeartbeat() {
 
 // Schedule periodic model training
 function scheduleModelTraining() {
-    // Train models every 12 hours
-    setInterval(async () => {
-        if (!ML_ENABLED) {
-            log('Scheduled model training skipped - ML is disabled', 'info');
-            return;
-        }
-
-        log('Starting scheduled model training...', 'info');
-
-        try {
-            // Get all symbols with sufficient data
-            const symbolsToTrain = Array.from(trainingData.keys())
-                .filter(symbol => {
-                    const data = trainingData.get(symbol);
-                    // Only use data points with future price change values
-                    const validData = data.filter(d => d.future_price_change !== null);
-                    return validData.length >= 100;
-                });
-
-            if (symbolsToTrain.length === 0) {
-                log('No symbols have enough data for training yet.', 'warning');
-                return;
-            }
-
-            log(`Training models for ${symbolsToTrain.length} symbols`, 'info');
-
-            let trainedCount = 0;
-            let failedCount = 0;
-
-            // Train models sequentially to avoid memory issues
-            for (const symbol of symbolsToTrain) {
-                try {
-                    const { trainModelForSymbol } = require('./src/ml/model');
-
-                    // Filter data to only include points with future price change
-                    const allData = trainingData.get(symbol);
-                    const validData = allData.filter(d => d.future_price_change !== null);
-
-                    if (validData.length < 100) {
-                        log(`Not enough valid data points for ${symbol}: ${validData.length}`, 'warning');
-                        failedCount++;
-                        continue;
-                    }
-
-                    const result = await trainModelForSymbol(symbol);
-
-                    if (result) {
-                        trainedCount++;
-
-                        // Update model performance tracking
-                        if (!modelPerformance.has(symbol)) {
-                            modelPerformance.set(symbol, {
-                                predictions: 0,
-                                correctPredictions: 0,
-                                accuracy: 0,
-                                lastTraining: new Date().toISOString(),
-                                dataPoints: validData.length
-                            });
-                        } else {
-                            const perf = modelPerformance.get(symbol);
-                            perf.lastTraining = new Date().toISOString();
-                            perf.dataPoints = validData.length;
-                            modelPerformance.set(symbol, perf);
-                        }
-                    } else {
-                        failedCount++;
-                    }
-
-                    // Add a small delay between training sessions
-                    await new Promise(resolve => setTimeout(resolve, 5000));
-                } catch (error) {
-                    log(`Error training model for ${symbol}: ${error.message}`, 'error');
-                    failedCount++;
-                }
-            }
-
-            // Save updated model performance data
-            saveTrainingData();
-
-            log(`Scheduled training completed. Trained ${trainedCount}/${symbolsToTrain.length} models.`, 'success');
-
-            // Send notification about training completion
-            if (trainedCount > 0) {
-                await bot.sendMessage(
-                    TELEGRAM_CHAT_ID,
-                    `🧠 *ML Model Training Completed*\n\n` +
-                    `Successfully trained ${trainedCount} models.\n` +
-                    `These models will now be used to enhance crossover alerts with price predictions.`,
-                    { parse_mode: 'Markdown' }
-                );
-            }
-        } catch (error) {
-            log(`Error in scheduled model training: ${error.message}`, 'error');
-        }
-    }, 12 * 60 * 60 * 1000); // 12 hours
+    if (mlRuntime) mlRuntime.scheduleModelTraining(() => ML_ENABLED);
 }
 
 // Set up message and callback query handlers
@@ -3243,37 +2449,8 @@ process.on('unhandledRejection', (reason, promise) => {
 
 // Calculate ATR (Average True Range) using Wilder's smoothing
 function calculateATR(klines, period = 14) {
-    if (klines.length < period + 1) {
-        return 0;
-    }
-
-    const trueRanges = [];
-
-    // Calculate True Range for each candle
-    for (let i = 1; i < klines.length; i++) {
-        const high = klines[i].high;
-        const low = klines[i].low;
-        const prevClose = klines[i - 1].close;
-
-        // True Range is the greatest of:
-        // 1. Current High - Current Low
-        // 2. |Current High - Previous Close|
-        // 3. |Current Low - Previous Close|
-        const tr1 = high - low;
-        const tr2 = Math.abs(high - prevClose);
-        const tr3 = Math.abs(low - prevClose);
-
-        const trueRange = Math.max(tr1, tr2, tr3);
-        trueRanges.push(trueRange);
-    }
-
-    // Wilder's smoothed ATR: seed with SMA of first `period` TRs, then smooth
-    let atr = trueRanges.slice(0, period).reduce((sum, tr) => sum + tr, 0) / period;
-    for (let i = period; i < trueRanges.length; i++) {
-        atr = (atr * (period - 1) + trueRanges[i]) / period;
-    }
-
-    return atr;
+    if (!mlRuntime) return 0;
+    return mlRuntime.calculateATR(klines, period);
 }
 
 // Remove log files older than 7 days to prevent unbounded disk growth
@@ -3335,6 +2512,24 @@ async function initialize() {
         // Initialize ML components
         console.log('Initializing machine learning components...'.cyan);
 
+        mlRuntime = createMLRuntime({
+            log,
+            bot,
+            telegramChatId: TELEGRAM_CHAT_ID,
+            mlDataDir: ML_DATA_DIR,
+            csvDataDir: CSV_DATA_DIR,
+            modelPath: MODEL_PATH,
+            deltaRestBaseUrl: DELTA_REST_BASE_URL,
+            enforceRateLimit,
+            getFuturesPairs,
+            getKlines,
+            processClosedCandle,
+            getDualMode: () => DUAL_EMA_MODE,
+            getDualEmaTimeframes,
+            tfKey,
+            klineCache
+        });
+
         // Create models directory if it doesn't exist
         const modelsDir = path.join(__dirname, 'models');
         if (!fs.existsSync(modelsDir)) {
@@ -3358,7 +2553,7 @@ async function initialize() {
         await sendStartupMessage();
 
         // Do initial check to populate data
-        await checkEMACross();
+        await checkEMACross({ emitAlerts: false });
 
         // Mark initial load complete before WebSocket/interval registration so
         // periodic tasks never run with stale startup state.
@@ -3409,7 +2604,7 @@ async function initialize() {
         // This is in addition to the real-time WebSocket monitoring
         monitoringInterval = setInterval(async () => {
             log('Running periodic check as backup to WebSockets...', 'info');
-            await checkEMACross();
+            await checkEMACross({ emitAlerts: false });
         }, CHECK_INTERVAL);
 
         log(`Initialization complete. Bot is now monitoring in real-time via WebSockets${ML_ENABLED ? ' with ML enhancement' : ''}.`, 'success');
