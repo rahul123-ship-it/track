@@ -194,9 +194,9 @@ async function safeSendAlert(chatId, text, opts) {
     }
 }
 
-// Build a chart URL for a given symbol on Delta Exchange India
+// Build a chart URL for a given symbol on TradingView (using Delta Exchange data)
 function getChartUrl(symbol) {
-    return `https://india.delta.exchange/trade/${symbol}`;
+    return `https://www.tradingview.com/chart/?symbol=DELTA:${symbol}`;
 }
 // Returns a human-readable timeframe label for the current mode.
 // Dual mode doesn't have a single TF, so we reflect the actual tf arg or show both.
@@ -515,7 +515,7 @@ async function alertNewHighVolumePairs(newPairs) {
             `<b>24h Change:</b> ${pair.change.toFixed(2)}%\n` +
             `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
             `This pair has been added to the monitoring list.\n\n` +
-            `<a href="${chartUrl}">View Chart on Delta Exchange</a>`;
+            `<a href="${chartUrl}">View Chart on TradingView</a>`;
 
         try {
             await bot.sendMessage(TELEGRAM_CHAT_ID, message, { 
@@ -762,7 +762,7 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
             oiLine +
             `<b>Timeframe:</b> ${activeTimeframeLabel()}\n\n` +
             `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-            `<a href="${chartUrl}">View Chart on Delta Exchange</a>`;
+            `<a href="${chartUrl}">View Chart on TradingView</a>`;
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'HTML',
