@@ -143,7 +143,7 @@ const WS_TOPICS_PER_CONN = 100;  // Keep pool size conservative for stable publi
 const wsPool = [];                // [{ ws, symbols: Set<string>, index }]
 const MIN_CROSS_PCT = 0.0003; // 0.03% minimum crossover margin to reduce whipsaw
 // Validation constants — shared by settings loader and callback handler
-const VALID_VOLUMES    = [5_000_000, 10_000_000, 20_000_000, 50_000_000, 100_000_000, 200_000_000];
+const VALID_VOLUMES    = [2_000_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000, 100_000_000, 200_000_000];
 const VALID_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h'];
 const VALID_EMA_PERIODS = [50, 100, 200];
 let isReconnecting = false; // Prevents stacked reconnectionsduring graceful restarts
@@ -197,7 +197,7 @@ async function safeSendAlert(chatId, text, opts) {
 // Build a TradingView chart URL for a given symbol (handles non-USDT pairs gracefully)
 function getTradingViewUrl(symbol) {
     const base = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
-    return `https://www.tradingview.com/chart/?symbol=BYBIT:${base}USDT.P`;
+    return `https://www.tradingview.com/chart/?symbol=BINANCE:${base}USD.P`;
 }
 // Returns a human-readable timeframe label for the current mode.
 // Dual mode doesn't have a single TF, so we reflect the actual tf arg or show both.
@@ -543,11 +543,13 @@ async function getKlines(symbol, tf = null) {
     try {
         const interval = tf || TIMEFRAME;
         // Request enough candles for the active EMA period
-        const requiredPeriod = DUAL_EMA_MODE ? 15 : EMA_PERIOD;
-        const limit = requiredPeriod + 100;
+        // Request enough candles for the active EMA period + a large warmup for accuracy
+        const limit = 1000;
 
         const end = Math.floor(Date.now() / 1000);
         const start = end - (timeframeToSeconds(interval) * (limit + 5));
+
+        await enforceRateLimit();
 
         const response = await axios.get(`${DELTA_REST_BASE_URL}/history/candles`, {
             params: { resolution: interval, symbol, start, end },
@@ -630,7 +632,7 @@ function calculateEMA(prices, period) {
 }
 
 // Update EMA with a new price (for real-time updates)
-function updateEMA(symbol, newPrice) {
+function updateEMA(symbol, newPrice, isNewCandle = false) {
     // Get cached EMA values
     let emaValues = emaCache.get(symbol);
 
@@ -641,11 +643,20 @@ function updateEMA(symbol, newPrice) {
     }
 
     const k = 2 / (EMA_PERIOD + 1);
-    const lastEMA = emaValues[emaValues.length - 1];
-    const newEMA = (newPrice - lastEMA) * k + lastEMA;
 
-    // Add the new EMA to the cache
-    emaValues.push(newEMA);
+    if (isNewCandle) {
+        const lastEMA = emaValues[emaValues.length - 1];
+        const newEMA = (newPrice - lastEMA) * k + lastEMA;
+        emaValues.push(newEMA);
+    } else {
+        if (emaValues.length < 2) {
+            emaValues[emaValues.length - 1] = newPrice;
+        } else {
+            const prevClosedEMA = emaValues[emaValues.length - 2];
+            const updatedEMA = (newPrice - prevClosedEMA) * k + prevClosedEMA;
+            emaValues[emaValues.length - 1] = updatedEMA;
+        }
+    }
 
     // Keep the cache size reasonable by removing older values
     if (emaValues.length > EMA_PERIOD * 2) {
@@ -656,17 +667,34 @@ function updateEMA(symbol, newPrice) {
     return true;
 }
 
-// Incremental O(1) dual EMA update — appends one new EMA(9) and EMA(15) value
+// Incremental O(1) dual EMA update
 // key — tfKey(symbol, tf) in dual mode, or symbol in single mode
-function updateDualEMA(key, newClose) {
+function updateDualEMA(key, newClose, isNewCandle = false) {
     const e9  = ema9Cache.get(key);
     const e15 = ema15Cache.get(key);
     if (!e9?.length || !e15?.length) return false;
 
     const k9  = 2 / (9  + 1);
     const k15 = 2 / (15 + 1);
-    e9.push((newClose - e9.at(-1)) * k9  + e9.at(-1));
-    e15.push((newClose - e15.at(-1)) * k15 + e15.at(-1));
+
+    if (isNewCandle) {
+        e9.push((newClose - e9.at(-1)) * k9  + e9.at(-1));
+        e15.push((newClose - e15.at(-1)) * k15 + e15.at(-1));
+    } else {
+        if (e9.length >= 2) {
+            const prevClosedE9 = e9.at(-2);
+            e9[e9.length - 1] = (newClose - prevClosedE9) * k9 + prevClosedE9;
+        } else {
+            e9[e9.length - 1] = newClose;
+        }
+
+        if (e15.length >= 2) {
+            const prevClosedE15 = e15.at(-2);
+            e15[e15.length - 1] = (newClose - prevClosedE15) * k15 + prevClosedE15;
+        } else {
+            e15[e15.length - 1] = newClose;
+        }
+    }
 
     // Keep arrays bounded (max 200 entries is plenty for EMA9/15)
     if (e9.length  > 200) e9.splice(0, e9.length - 200);
@@ -734,7 +762,7 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'Markdown',
-            disable_web_page_preview: false
+            disable_web_page_preview: true
         });
 
         // Show desktop notification — mirrors Telegram message content
@@ -863,7 +891,7 @@ function setupPoolConnection(index, symbols) {
                 log(`Pool WS #${index} reconnecting in ${Math.round(backoff / 1000)}s (attempt ${currentAttempts + 1}/${MAX_RECONNECTION_ATTEMPTS})`, 'info');
                 setTimeout(() => {
                     const live = Array.from(poolEntry.symbols).filter(s => trackedPairs.has(s));
-                    if (live.length > 0) wsPool[index] = setupPoolConnection(index, live);
+                    if (live.length > 0) backfillAndReconnect(index, live);
                 }, backoff);
             } else {
                 log(`Pool WS #${index} max reconnection attempts reached`, 'warning');
@@ -883,7 +911,7 @@ function setupPoolConnection(index, symbols) {
                 log(`Pool WS #${index} reconnecting in ${Math.round(backoff / 1000)}s (attempt ${currentAttempts + 1}/${MAX_RECONNECTION_ATTEMPTS})`, 'info');
                 setTimeout(() => {
                     const live = Array.from(poolEntry.symbols).filter(s => trackedPairs.has(s));
-                    if (live.length > 0) wsPool[index] = setupPoolConnection(index, live);
+                    if (live.length > 0) backfillAndReconnect(index, live);
                 }, backoff);
             }
         });
@@ -892,6 +920,33 @@ function setupPoolConnection(index, symbols) {
     } catch (error) {
         log(`Error creating pool WS #${index}: ${error.message}`, 'error');
         return null;
+    }
+}
+
+// Reconnect pool connection with historical data backfill
+async function backfillAndReconnect(index, symbols) {
+    try {
+        log(`Backfilling historical data for pool WS #${index} before reconnecting...`, 'info');
+        const promises = [];
+        if (DUAL_EMA_MODE) {
+            for (const tf of getDualEmaTimeframes()) {
+                for (const symbol of symbols) {
+                    promises.push(() => getKlines(symbol, tf).catch(e => log(`Error backfilling ${symbol} [${tf}]: ${e.message}`, 'warning')));
+                }
+            }
+        } else {
+            for (const symbol of symbols) {
+                promises.push(() => getKlines(symbol).catch(e => log(`Error backfilling ${symbol}: ${e.message}`, 'warning')));
+            }
+        }
+
+        // Fetch in chunks
+        await fetchInChunks(promises, 8, 1500);
+        log(`Backfill complete for pool WS #${index}. Reconnecting...`, 'success');
+    } catch (error) {
+        log(`Error during backfill for pool WS #${index}: ${error.message}`, 'error');
+    } finally {
+        wsPool[index] = setupPoolConnection(index, symbols);
     }
 }
 
@@ -980,9 +1035,21 @@ async function processClosedCandle(symbol, kline, tf = null) {
         // Get cached klines or initialize if not exists
         let klines = klineCache.get(cacheKey) || [];
 
+        // Determine if it's a new candle bucket based on timeframe
+        const tfSecs = timeframeToSeconds(tf || TIMEFRAME);
+        const tfMs = tfSecs * 1000;
+        const candleTimeMs = Math.floor(Date.now() / tfMs) * tfMs;
+
+        // Ignore stale messages that are older than our most recent candle
+        if (klines.length > 0 && candleTimeMs < klines[klines.length - 1].time) {
+            return;
+        }
+
+        const isNewCandle = klines.length === 0 || candleTimeMs > klines[klines.length - 1].time;
+
         // Create new kline object
         const newKline = {
-            time: kline.t,
+            time: candleTimeMs,
             open: parseFloat(kline.o),
             high: parseFloat(kline.h),
             low: parseFloat(kline.l),
@@ -990,8 +1057,12 @@ async function processClosedCandle(symbol, kline, tf = null) {
             volume: parseFloat(kline.v)
         };
 
-        // Add new kline to cache
-        klines.push(newKline);
+        if (isNewCandle) {
+            klines.push(newKline);
+        } else {
+            // Update the existing candle with the latest real-time data
+            klines[klines.length - 1] = newKline;
+        }
 
         // Keep cache size reasonable
         const maxCacheSize = DUAL_EMA_MODE ? 200 : EMA_PERIOD * 2;
@@ -1007,8 +1078,8 @@ async function processClosedCandle(symbol, kline, tf = null) {
 
         // Calculate EMA values based on current mode
         if (DUAL_EMA_MODE) {
-            // Incremental O(1) dual EMA update — fall back to full recalc on first candle
-            const updated = updateDualEMA(cacheKey, newKline.close);
+            // Incremental O(1) dual EMA update
+            const updated = updateDualEMA(cacheKey, newKline.close, isNewCandle);
             if (!updated) {
                 ema9Cache.set(cacheKey, calculateEMA(closes, 9));
                 ema15Cache.set(cacheKey, calculateEMA(closes, 15));
@@ -1032,8 +1103,8 @@ async function processClosedCandle(symbol, kline, tf = null) {
                 );
             }
         } else {
-            // Single EMA mode — update incrementally if cached, fall back to full recalc on first candle
-            const updated = updateEMA(symbol, newKline.close);
+            // Single EMA mode — update incrementally
+            const updated = updateEMA(symbol, newKline.close, isNewCandle);
             if (!updated) {
                 const freshEma = calculateEMA(closes, EMA_PERIOD);
                 emaCache.set(symbol, freshEma);
@@ -1050,33 +1121,39 @@ async function processClosedCandle(symbol, kline, tf = null) {
             }
         }
 
-        // Collect data for ML training if we have enough data
-        if (klines.length >= 30 && ML_ENABLED && !DUAL_EMA_MODE) {
+        // Collect data for ML training ONLY on candle close (when a new candle bucket starts)
+        // to avoid writing 100s of identical data points per candle to disk.
+        if (isNewCandle && klines.length >= 31 && ML_ENABLED && !DUAL_EMA_MODE) {
             const emaValues = emaCache.get(symbol) || [];
-            if (emaValues.length === 0) return;
+            if (emaValues.length < 2) return;
 
-            // Calculate additional indicators — cache module ref so require() only runs once
+            // Calculate additional indicators on the PREVIOUS closed candle
+            const closedKlines = klines.slice(0, -1);
+            const closedCloses = closedKlines.map(k => k.close);
+            const closedVolumes = closedKlines.map(k => k.volume);
+            const lastClosedKline = closedKlines[closedKlines.length - 1];
+
             if (!_indicatorsModule) _indicatorsModule = require('./src/indicators');
             const { calculateRSI, calculateMACD, calculateBollingerBands } = _indicatorsModule;
-            const rsi = calculateRSI(closes);
-            const macd = calculateMACD(closes);
-            const bb = calculateBollingerBands(closes);
+            const rsi = calculateRSI(closedCloses);
+            const macd = calculateMACD(closedCloses);
+            const bb = calculateBollingerBands(closedCloses);
 
-            // Calculate ATR
-            const atr = calculateATR(klines);
-            const atrValid = klines.length >= 15;
+            const atr = calculateATR(closedKlines);
+            const atrValid = closedKlines.length >= 15;
 
-            // Create feature vector
+            const lastClosedEMA = emaValues[emaValues.length - 2];
+
             const dataPoint = {
-                timestamp: kline.t,
+                timestamp: lastClosedKline.time,
                 symbol: symbol,
-                open: newKline.open,
-                high: newKline.high,
-                low: newKline.low,
-                close: newKline.close,
-                volume: newKline.volume,
-                ema: emaValues[emaValues.length - 1],
-                ema_diff: ((newKline.close - emaValues[emaValues.length - 1]) / emaValues[emaValues.length - 1] * 100),
+                open: lastClosedKline.open,
+                high: lastClosedKline.high,
+                low: lastClosedKline.low,
+                close: lastClosedKline.close,
+                volume: lastClosedKline.volume,
+                ema: lastClosedEMA,
+                ema_diff: ((lastClosedKline.close - lastClosedEMA) / lastClosedEMA * 100),
                 rsi: rsi[rsi.length - 1],
                 macd: macd.macd[macd.macd.length - 1],
                 macd_signal: macd.signal[macd.signal.length - 1],
@@ -1087,10 +1164,9 @@ async function processClosedCandle(symbol, kline, tf = null) {
                 bb_width: (bb.upper[bb.upper.length - 1] - bb.lower[bb.lower.length - 1]) / bb.middle[bb.middle.length - 1],
                 atr: atr,
                 atr_valid: atrValid,
-                volume_change: volumes.length > 1 ? volumes[volumes.length - 1] / volumes[volumes.length - 2] - 1 : 0,
-                // Target variable (to be filled later)
+                volume_change: closedVolumes.length > 1 ? closedVolumes[closedVolumes.length - 1] / closedVolumes[closedVolumes.length - 2] - 1 : 0,
                 future_price_change: null,
-                label: null // 1 for price increase, 0 for decrease
+                label: null
             };
 
             // Store data in memory
@@ -1115,7 +1191,7 @@ async function processClosedCandle(symbol, kline, tf = null) {
             }
 
             // Schedule update of future price change (after 24 hours)
-            deferredInsert({ executeAt: Date.now() + 24 * 60 * 60 * 1000, fn: () => updateFuturePriceChange(symbol, kline.t) });
+            deferredInsert({ executeAt: Date.now() + 24 * 60 * 60 * 1000, fn: () => updateFuturePriceChange(symbol, lastClosedKline.time) });
             // Safety cap — oldest entries are stale beyond 24 h; discard if queue grows unexpectedly
             if (deferredUpdates.length > 5000) deferredUpdates.splice(0, deferredUpdates.length - 5000);
         }
@@ -1514,7 +1590,7 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, t
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'Markdown',
-            disable_web_page_preview: false
+            disable_web_page_preview: true
         });
 
         // Show desktop notification — mirrors Telegram message content
@@ -1699,12 +1775,12 @@ async function setupAllWebSockets() {
 // Without chunking, a concurrent Promise.all on 80+ getKlines calls all read the
 // same lastApiCall timestamp in the same millisecond — effectively bypassing the
 // limiter and increasing 429/backoff risk.
-async function fetchInChunks(promises, chunkSize = 8, delayMs = 1500) {
+async function fetchInChunks(factories, chunkSize = 8, delayMs = 1500) {
     const results = [];
-    for (let i = 0; i < promises.length; i += chunkSize) {
-        const batch = promises.slice(i, i + chunkSize);
+    for (let i = 0; i < factories.length; i += chunkSize) {
+        const batch = factories.slice(i, i + chunkSize).map(f => f());
         results.push(...await Promise.all(batch));
-        if (i + chunkSize < promises.length) {
+        if (i + chunkSize < factories.length) {
             await new Promise(r => setTimeout(r, delayMs));
         }
     }
@@ -1729,7 +1805,7 @@ async function checkEMACross() {
             for (const tf of getDualEmaTimeframes()) {
                 for (const pair of pairs) {
                     dualPromises.push(
-                        getKlines(pair, tf)
+                        () => getKlines(pair, tf)
                             .then(klines => ({ pair, tf, klines, error: null }))
                             .catch(error => ({ pair, tf, klines: [], error }))
                     );
@@ -1741,7 +1817,7 @@ async function checkEMACross() {
             // getKlines calls don't race to read the same lastApiCall timestamp,
             // bypassing enforceRateLimit and triggering rate-limit stalls.
             const singlePromises = pairs.map(pair =>
-                getKlines(pair)
+                () => getKlines(pair)
                     .then(klines => ({ pair, tf: null, klines, error: null }))
                     .catch(error => ({ pair, tf: null, klines: [], error }))
             );
@@ -2057,7 +2133,7 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'Markdown',
-            disable_web_page_preview: false
+            disable_web_page_preview: true
         });
 
         // Show desktop notification — mirrors Telegram message content
@@ -2559,15 +2635,18 @@ async function sendSettingsMenu(chatId) {
                 { text: `Fast TF (1m/3m): ${INCLUDE_FAST_TFS ? 'Enabled ✅' : 'Disabled ❌'}`, callback_data: 'toggle_fast_tfs' }
             ],
             [
-                { text: 'Vol 5M', callback_data: 'volume_5000000' },
-                { text: 'Vol 10M', callback_data: 'volume_10000000' }
+                { text: 'Vol 2M', callback_data: 'volume_2000000' },
+                { text: 'Vol 5M', callback_data: 'volume_5000000' }
             ],
             [
-                { text: 'Vol 20M', callback_data: 'volume_20000000' },
-                { text: 'Vol 50M', callback_data: 'volume_50000000' }
+                { text: 'Vol 10M', callback_data: 'volume_10000000' },
+                { text: 'Vol 20M', callback_data: 'volume_20000000' }
             ],
             [
-                { text: 'Vol 100M', callback_data: 'volume_100000000' },
+                { text: 'Vol 50M', callback_data: 'volume_50000000' },
+                { text: 'Vol 100M', callback_data: 'volume_100000000' }
+            ],
+            [
                 { text: 'Vol 200M', callback_data: 'volume_200000000' }
             ],
             [
@@ -2802,7 +2881,7 @@ function startWebSocketHeartbeat() {
                     const live = Array.from(entry.symbols).filter(s => trackedPairs.has(s));
                     if (live.length > 0) {
                         reconnectionAttempts.set(`pool_${i}`, 0);
-                        wsPool[i] = setupPoolConnection(i, live);
+                        backfillAndReconnect(i, live);
                         reconnected++;
                     }
                 }
