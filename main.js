@@ -196,8 +196,9 @@ async function safeSendAlert(chatId, text, opts) {
 
 // Build a TradingView chart URL for a given symbol (handles non-USDT pairs gracefully)
 function getTradingViewUrl(symbol) {
-    const base = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
-    return `https://www.tradingview.com/chart/?symbol=BINANCE:${base}USD.P`;
+    const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
+    const base = safeSymbol.endsWith('USDT') ? safeSymbol.slice(0, -4) : safeSymbol;
+    return `https://www.tradingview.com/chart/?symbol=BINANCE:${base}USDT.P`;
 }
 // Returns a human-readable timeframe label for the current mode.
 // Dual mode doesn't have a single TF, so we reflect the actual tf arg or show both.
@@ -508,23 +509,28 @@ async function getFuturesPairs() {
 // Alert when new pairs cross the volume threshold
 async function alertNewHighVolumePairs(newPairs) {
     for (const pair of newPairs) {
-        const message = `🔔 *NEW HIGH VOLUME PAIR DETECTED*\n\n` +
-            `*Symbol:* ${pair.symbol}\n` +
-            `*Volume:* ${formatVolume(pair.volume)}\n` +
-            `*Price:* ${formatPrice(pair.price)}\n` +
-            `*24h Change:* ${pair.change.toFixed(2)}%\n` +
-            `*Time:* ${new Date().toLocaleString()}\n\n` +
-            `This pair has been added to the monitoring list.`;
+        const tradingViewUrl = getTradingViewUrl(pair.symbol);
+        const message = `🔔 <b>NEW HIGH VOLUME PAIR DETECTED</b>\n\n` +
+            `<b>Symbol:</b> ${pair.symbol}\n` +
+            `<b>Volume:</b> ${formatVolume(pair.volume)}\n` +
+            `<b>Price:</b> ${formatPrice(pair.price)}\n` +
+            `<b>24h Change:</b> ${pair.change.toFixed(2)}%\n` +
+            `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
+            `This pair has been added to the monitoring list.\n\n` +
+            `<a href="${tradingViewUrl}">View Chart on TradingView</a>`;
 
         try {
-            await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
+            await bot.sendMessage(TELEGRAM_CHAT_ID, message, { 
+                parse_mode: 'HTML',
+                disable_web_page_preview: true
+            });
 
             // Show desktop notification — match Telegram content
             showDesktopNotification(
                 `🔔 New High Volume Pair: ${pair.symbol}`,
                 `Volume: ${formatVolume(pair.volume)}  Price: ${formatPrice(pair.price)}\n24h Change: ${pair.change.toFixed(2)}%  Added to monitoring`,
                 'info',
-                getTradingViewUrl(pair.symbol)
+                tradingViewUrl
             );
 
             log(`New high volume pair alert sent for ${pair.symbol} with volume ${formatVolume(pair.volume)}`, 'success');
@@ -746,22 +752,22 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
         const tradingViewUrl = getTradingViewUrl(symbol);
 
         const oiLine = oi
-            ? `*OI Delta:* ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '\u{1F4C8} new money (stronger)' : oi.deltaPercent <= -0.5 ? '\u{1F4C9} liquidation (weaker)' : '\u2192 neutral'}\n`
+            ? `<b>OI Delta:</b> ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '\u{1F4C8} new money (stronger)' : oi.deltaPercent <= -0.5 ? '\u{1F4C9} liquidation (weaker)' : '\u2192 neutral'}\n`
             : '';
-        const message = `${emoji} *${signal}* ${emoji}\n\n` +
-            `*Symbol:* ${symbol}\n` +
-            `*Price:* ${formattedPrice}\n` +
-            `*EMA(${EMA_PERIOD}):* ${formattedEma}\n` +
-            `*Difference:* ${difference.toFixed(2)}%\n` +
-            `*24h Change:* ${stats.priceChangePercent}%\n` +
-            `*24h Volume:* ${formatVolume(stats.quoteVolume)}\n` +
+        const message = `${emoji} <b>${signal}</b> ${emoji}\n\n` +
+            `<b>Symbol:</b> ${symbol}\n` +
+            `<b>Price:</b> ${formattedPrice}\n` +
+            `<b>EMA(${EMA_PERIOD}):</b> ${formattedEma}\n` +
+            `<b>Difference:</b> ${difference.toFixed(2)}%\n` +
+            `<b>24h Change:</b> ${stats.priceChangePercent}%\n` +
+            `<b>24h Volume:</b> ${formatVolume(stats.quoteVolume)}\n` +
             oiLine +
-            `*Timeframe:* ${activeTimeframeLabel()}\n\n` +
-            `*Time:* ${new Date().toLocaleString()}\n\n` +
-            `[View Chart on TradingView](${tradingViewUrl})`;
+            `<b>Timeframe:</b> ${activeTimeframeLabel()}\n\n` +
+            `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
+            `<a href="${tradingViewUrl}">View Chart on TradingView</a>`;
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
-            parse_mode: 'Markdown',
+            parse_mode: 'HTML',
             disable_web_page_preview: true
         });
 
@@ -1573,23 +1579,23 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, t
         const tradingViewUrl = getTradingViewUrl(symbol);
 
         const oiLine = oi
-            ? `*OI Delta:* ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '\u{1F4C8} new money (stronger)' : oi.deltaPercent <= -0.5 ? '\u{1F4C9} liquidation (weaker)' : '\u2192 neutral'}\n`
+            ? `<b>OI Delta:</b> ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '\u{1F4C8} new money (stronger)' : oi.deltaPercent <= -0.5 ? '\u{1F4C9} liquidation (weaker)' : '\u2192 neutral'}\n`
             : '';
-        const message = `${emoji} *${signal}* ${emoji}\n\n` +
-            `*Symbol:* ${symbol}\n` +
-            `*Price:* ${formatPrice(price)}\n` +
-            `*EMA(9):* ${formatPrice(ema9)}\n` +
-            `*EMA(15):* ${formatPrice(ema15)}\n` +
-            `*EMA Spread:* ${spread.toFixed(4)}%\n` +
-            `*24h Change:* ${stats.priceChangePercent}%\n` +
-            `*24h Volume:* ${formatVolume(stats.quoteVolume)}\n` +
+        const message = `${emoji} <b>${signal}</b> ${emoji}\n\n` +
+            `<b>Symbol:</b> ${symbol}\n` +
+            `<b>Price:</b> ${formatPrice(price)}\n` +
+            `<b>EMA(9):</b> ${formatPrice(ema9)}\n` +
+            `<b>EMA(15):</b> ${formatPrice(ema15)}\n` +
+            `<b>EMA Spread:</b> ${spread.toFixed(4)}%\n` +
+            `<b>24h Change:</b> ${stats.priceChangePercent}%\n` +
+            `<b>24h Volume:</b> ${formatVolume(stats.quoteVolume)}\n` +
             oiLine +
-            `*Timeframe:* ${activeTimeframeLabel(tf)}\n\n` +
-            `*Time:* ${new Date().toLocaleString()}\n\n` +
-            `[View Chart on TradingView](${tradingViewUrl})`;
+            `<b>Timeframe:</b> ${activeTimeframeLabel(tf)}\n\n` +
+            `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
+            `<a href="${tradingViewUrl}">View Chart on TradingView</a>`;
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
-            parse_mode: 'Markdown',
+            parse_mode: 'HTML',
             disable_web_page_preview: true
         });
 
@@ -2112,27 +2118,26 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
             confidenceEmoji = prediction > 0 ? '📈' : '📉'; // Moderate signal
         }
 
-        // Create a TradingView link
         const tradingViewUrl = getTradingViewUrl(symbol);
 
         const oiLine = oi
-            ? `*OI Delta:* ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '📈 new money (stronger)' : oi.deltaPercent <= -0.5 ? '📉 liquidation (weaker)' : '→ neutral'}\n`
+            ? `<b>OI Delta:</b> ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '📈 new money (stronger)' : oi.deltaPercent <= -0.5 ? '📉 liquidation (weaker)' : '→ neutral'}\n`
             : '';
-        const message = `${emoji} *${signal}* ${emoji}\n\n` +
-            `*Symbol:* ${symbol}\n` +
-            `*Price:* ${formattedPrice}\n` +
-            `*EMA(${EMA_PERIOD}):* ${formattedEma}\n` +
-            `*Difference:* ${difference.toFixed(2)}%\n` +
-            `*24h Change:* ${stats.priceChangePercent}%\n` +
-            `*24h Volume:* ${formatVolume(stats.quoteVolume)}\n` +
+        const message = `${emoji} <b>${signal}</b> ${emoji}\n\n` +
+            `<b>Symbol:</b> ${symbol}\n` +
+            `<b>Price:</b> ${formattedPrice}\n` +
+            `<b>EMA(${EMA_PERIOD}):</b> ${formattedEma}\n` +
+            `<b>Difference:</b> ${difference.toFixed(2)}%\n` +
+            `<b>24h Change:</b> ${stats.priceChangePercent}%\n` +
+            `<b>24h Volume:</b> ${formatVolume(stats.quoteVolume)}\n` +
             oiLine +
-            `*Timeframe:* ${activeTimeframeLabel()}\n` +
-            `*ML Prediction:* ${confidenceEmoji} ${prediction.toFixed(2)}% (24h)\n\n` +
-            `*Time:* ${new Date().toLocaleString()}\n\n` +
-            `[View Chart on TradingView](${tradingViewUrl})`;
+            `<b>Timeframe:</b> ${activeTimeframeLabel()}\n` +
+            `<b>ML Prediction:</b> ${confidenceEmoji} ${prediction.toFixed(2)}% (24h)\n\n` +
+            `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
+            `<a href="${tradingViewUrl}">View Chart on TradingView</a>`;
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
-            parse_mode: 'Markdown',
+            parse_mode: 'HTML',
             disable_web_page_preview: true
         });
 
