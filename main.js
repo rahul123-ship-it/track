@@ -22,7 +22,8 @@ let ML_ENABLED = false;
 // Dual EMA crossover mode: when true, alerts on EMA(9) vs EMA(15) crossover instead of price vs single EMA
 let DUAL_EMA_MODE = false;
 // Optional fast timeframe addon for dual mode: include 1m+3m alongside 5m+15m
-let INCLUDE_FAST_TFS = (process.env.INCLUDE_FAST_TFS || 'false').toLowerCase() === 'true';
+let INCLUDE_FAST_TFS = (process.env.INCLUDE_FAST_TFS || 'true').toLowerCase() === 'true';
+const FORCE_ALL_DUAL_TFS = (process.env.FORCE_ALL_DUAL_TFS || 'true').toLowerCase() === 'true';
 
 // Configuration
 let EMA_PERIOD = parseInt(process.env.EMA_PERIOD, 10) || 200;
@@ -33,7 +34,12 @@ const ALERT_COOLDOWN = parseInt(process.env.ALERT_COOLDOWN, 10) || 1 * 60 * 1000
 
 // Flat EMA filter configuration - suppresses alerts during sideways markets
 const FLAT_EMA_PERIODS = 5; // Number of candles to look back for slope calculation
-const FLAT_EMA_HYSTERESIS = 2; // Required consecutive non-flat readings before allowing alerts
+const FLAT_EMA_HYSTERESIS = Math.max(1, parseInt(process.env.FLAT_EMA_HYSTERESIS || '1', 10));
+const FLAT_EMA_THRESHOLD_SCALE = (() => {
+    const parsed = parseFloat(process.env.FLAT_EMA_THRESHOLD_SCALE || '0.2');
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0.2;
+})();
+const DUAL_EMA_FLAT_FILTER = (process.env.DUAL_EMA_FLAT_FILTER || 'false').toLowerCase() === 'true';
 // Per-timeframe thresholds: faster TFs need smaller thresholds (in percent)
 const FLAT_EMA_THRESHOLDS = {
     '1m': 0.005,   // 0.005% for 1m (5 candles = 5 minutes)
@@ -162,6 +168,11 @@ function tfKey(symbol, tf) { return `${symbol}_${tf}`; }
  * @returns {Object} { isFlat: boolean, reason: string|null }
  */
 function isEmaFlat(symbol, tf = '', useDualEma = false) {
+    // By default do not suppress dual EMA 9/15 crossovers with flat filter.
+    if (useDualEma && !DUAL_EMA_FLAT_FILTER) {
+        return { isFlat: false, reason: null };
+    }
+
     // Build correct cache key for dual mode
     const cacheKey = tf ? tfKey(symbol, tf) : symbol;
     const hysteresisKey = cacheKey;
@@ -192,7 +203,7 @@ function isEmaFlat(symbol, tf = '', useDualEma = false) {
     const emaChangePct = Math.abs((lastEMA - pastEMA) / pastEMA * 100);
 
     // Get threshold for this timeframe (default to 0.02% if not found)
-    const threshold = FLAT_EMA_THRESHOLDS[tf || TIMEFRAME] || 0.02;
+    const threshold = (FLAT_EMA_THRESHOLDS[tf || TIMEFRAME] || 0.02) * FLAT_EMA_THRESHOLD_SCALE;
 
     // Check if EMA is flat
     const isCurrentlyFlat = emaChangePct < threshold;
@@ -294,17 +305,44 @@ async function safeSendAlert(chatId, text, opts) {
 // Build a chart URL for a given symbol on TradingView (using Delta Exchange data)
 // Delta Exchange trades perpetual futures, so symbols need .P suffix on TradingView
 function getChartUrl(symbol, tf = '') {
-    // Ensure symbol has .P suffix for perpetual futures (required for Delta Exchange on TradingView)
-    const tvSymbol = symbol.endsWith('.P') ? symbol : `${symbol}.P`;
+    // Normalize Delta symbols for TradingView DELTA feed.
+    // Example: BTCUSD -> DELTA:BTCUSDT.P
+    const raw = String(symbol || '').toUpperCase().replace(/[^A-Z0-9.]/g, '');
+    const withoutPerp = raw.endsWith('.P') ? raw.slice(0, -2) : raw;
+    const withQuote = withoutPerp.endsWith('USD') && !withoutPerp.endsWith('USDT')
+        ? `${withoutPerp}T`
+        : withoutPerp;
+    const tvSymbol = withQuote.endsWith('.P') ? withQuote : `${withQuote}.P`;
 
     // Map bot timeframe to TradingView interval
     const timeframe = tf || TIMEFRAME;
-    const tvInterval = timeframe; // TradingView uses same format: 1m, 5m, 15m, 1h, 4h, 1d
+    const tvIntervalMap = {
+        '1m': '1',
+        '3m': '3',
+        '5m': '5',
+        '15m': '15',
+        '30m': '30',
+        '1h': '60',
+        '2h': '120',
+        '4h': '240',
+        '6h': '360',
+        '12h': '720',
+        '1d': '1D'
+    };
+    const tvInterval = tvIntervalMap[timeframe] || '15';
 
     // Primary: TradingView with Delta Exchange data
-    const tradingViewUrl = `https://www.tradingview.com/chart/?symbol=DELTA:${tvSymbol}&interval=${tvInterval}`;
+    const params = new URLSearchParams({
+        symbol: `DELTA:${tvSymbol}`,
+        interval: tvInterval
+    });
+    const tradingViewUrl = `https://www.tradingview.com/chart/?${params.toString()}`;
 
     return tradingViewUrl;
+}
+
+function getHtmlSafeUrl(url) {
+    return String(url || '').replace(/&/g, '&amp;');
 }
 // Returns a human-readable timeframe label for the current mode.
 // Dual mode doesn't have a single TF, so we reflect the actual tf arg or show both.
@@ -313,8 +351,12 @@ function activeTimeframeLabel(tf = '') {
     return TIMEFRAME;
 }
 // Central source of truth for dual-mode timeframe set.
+function isFastTfsActive() {
+    return FORCE_ALL_DUAL_TFS || INCLUDE_FAST_TFS;
+}
+
 function getDualEmaTimeframes() {
-    return INCLUDE_FAST_TFS ? ['1m', '3m', '5m', '15m'] : ['5m', '15m'];
+    return isFastTfsActive() ? ['1m', '3m', '5m', '15m'] : ['5m', '15m'];
 }
 function timeframeToSeconds(tf) {
     const map = {
@@ -618,7 +660,7 @@ async function alertNewHighVolumePairs(newPairs) {
             `<b>24h Change:</b> ${pair.change.toFixed(2)}%\n` +
             `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
             `This pair has been added to the monitoring list.\n\n` +
-            `<a href="${chartUrl}">View Chart on TradingView</a>`;
+            `<a href="${getHtmlSafeUrl(chartUrl)}">View Chart on TradingView</a>`;
 
         try {
             await bot.sendMessage(TELEGRAM_CHAT_ID, message, { 
@@ -865,7 +907,7 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
             oiLine +
             `<b>Timeframe:</b> ${activeTimeframeLabel()}\n\n` +
             `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-            `<a href="${chartUrl}">View Chart on TradingView</a>`;
+            `<a href="${getHtmlSafeUrl(chartUrl)}">View Chart on TradingView</a>`;
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'HTML',
@@ -1298,7 +1340,6 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
             if (flatCheck.isFlat) {
                 // Update state so next real crossover is detected, but don't consume cooldown
                 coinStates.set(symbol, currentState);
-                console.log(`  ⏸️  Alert suppressed: ${flatCheck.reason}`.gray);
                 traceAlert(`${symbol} single-mode bullish suppressed: ${flatCheck.reason}`);
                 return;
             }
@@ -1331,7 +1372,6 @@ async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA)
             if (flatCheck.isFlat) {
                 // Update state so next real crossover is detected, but don't consume cooldown
                 coinStates.set(symbol, currentState);
-                console.log(`  ⏸️  Alert suppressed: ${flatCheck.reason}`.gray);
                 traceAlert(`${symbol} single-mode bearish suppressed: ${flatCheck.reason}`);
                 return;
             }
@@ -1385,7 +1425,6 @@ async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, l
             if (flatCheck.isFlat) {
                 // Update state so next real crossover is detected, but don't consume cooldown
                 coinStates.set(stateKey, currentState);
-                console.log(`  ⏸️  Alert suppressed: ${flatCheck.reason}`.gray);
                 traceAlert(`${symbol}${tf ? ` [${tf}]` : ''} dual bullish suppressed: ${flatCheck.reason}`);
                 return;
             }
@@ -1412,7 +1451,6 @@ async function checkForDualEmaCrossover(symbol, prevEma9, lastEma9, prevEma15, l
             if (flatCheck.isFlat) {
                 // Update state so next real crossover is detected, but don't consume cooldown
                 coinStates.set(stateKey, currentState);
-                console.log(`  ⏸️  Alert suppressed: ${flatCheck.reason}`.gray);
                 traceAlert(`${symbol}${tf ? ` [${tf}]` : ''} dual bearish suppressed: ${flatCheck.reason}`);
                 return;
             }
@@ -1463,7 +1501,7 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, t
             oiLine +
             `<b>Timeframe:</b> ${activeTimeframeLabel(tf)}\n\n` +
             `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-            `<a href="${chartUrl}">View Chart on TradingView</a>`;
+            `<a href="${getHtmlSafeUrl(chartUrl)}">View Chart on TradingView</a>`;
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'HTML',
@@ -1741,7 +1779,7 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
             `<b>Timeframe:</b> ${activeTimeframeLabel()}\n` +
             `<b>ML Prediction:</b> ${confidenceEmoji} ${prediction.toFixed(2)}% (24h)\n\n` +
             `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-            `<a href="${chartUrl}">View Chart on TradingView</a>`;
+            `<a href="${getHtmlSafeUrl(chartUrl)}">View Chart on TradingView</a>`;
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'HTML',
@@ -1940,6 +1978,16 @@ async function handleCallbackQuery(callbackQuery) {
             await sendSettingsMenu(chatId); // show updated menu immediately
             refreshWebSockets(chatId);      // reconnect in background — sends its own progress msgs
         } else if (action === 'toggle_fast_tfs') {
+            if (FORCE_ALL_DUAL_TFS) {
+                await bot.sendMessage(
+                    chatId,
+                    '⚡ *Fast TF Add-on is locked ON by FORCE_ALL_DUAL_TFS=true*\nDual EMA mode always monitors 1m + 3m + 5m + 15m.',
+                    { parse_mode: 'Markdown' }
+                );
+                await sendSettingsMenu(chatId);
+                return;
+            }
+
             INCLUDE_FAST_TFS = !INCLUDE_FAST_TFS;
             log(`Fast dual timeframes ${INCLUDE_FAST_TFS ? 'enabled' : 'disabled'}`, 'success');
             saveSettings();
@@ -2152,7 +2200,12 @@ async function sendSettingsMenu(chatId) {
                 { text: `EMA 9/15 Cross: ${DUAL_EMA_MODE ? 'Enabled ✅' : 'Disabled ❌'}`, callback_data: 'toggle_dual_ema' }
             ],
             [
-                { text: `Fast TF (1m/3m): ${INCLUDE_FAST_TFS ? 'Enabled ✅' : 'Disabled ❌'}`, callback_data: 'toggle_fast_tfs' }
+                {
+                    text: FORCE_ALL_DUAL_TFS
+                        ? 'Fast TF (1m/3m): Locked ON 🔒'
+                        : `Fast TF (1m/3m): ${INCLUDE_FAST_TFS ? 'Enabled ✅' : 'Disabled ❌'}`,
+                    callback_data: 'toggle_fast_tfs'
+                }
             ],
             [
                 { text: 'Vol 2M', callback_data: 'volume_2000000' },
@@ -2177,7 +2230,7 @@ async function sendSettingsMenu(chatId) {
     };
 
     const configText = DUAL_EMA_MODE
-        ? `*Settings*\n\nCurrent Configuration:\n- EMA Mode: 9/15 Crossover ✅\n- Timeframe: ${getDualEmaTimeframes().join(' + ')} (all monitored)\n- Fast TF Add-on: ${INCLUDE_FAST_TFS ? 'Enabled ✅' : 'Disabled ❌'}\n- Volume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\n- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n\n_EMA 9/15 monitors all active dual timeframes simultaneously. Single EMA settings (50/100/200) are ignored._\n\nSelect a new setting:`
+        ? `*Settings*\n\nCurrent Configuration:\n- EMA Mode: 9/15 Crossover ✅\n- Timeframe: ${getDualEmaTimeframes().join(' + ')} (all monitored)\n- Fast TF Add-on: ${FORCE_ALL_DUAL_TFS ? 'Locked ON 🔒 (FORCE_ALL_DUAL_TFS)' : (INCLUDE_FAST_TFS ? 'Enabled ✅' : 'Disabled ❌')}\n- Volume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\n- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n\n_EMA 9/15 monitors all active dual timeframes simultaneously. Single EMA settings (50/100/200) are ignored._\n\nSelect a new setting:`
         : `*Settings*\n\nCurrent Configuration:\n- EMA: ${EMA_PERIOD}\n- Timeframe: ${TIMEFRAME}\n- Volume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\n- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n\nSelect a new setting:`;
 
     await bot.sendMessage(chatId, configText, {
@@ -2498,8 +2551,8 @@ function startHealthServer() {
 async function initialize() {
     try {
         // Initialize terminal and load settings
-        initializeTerminal();
         loadSettings();
+        initializeTerminal();
         startHealthServer();
         loadAlertState(); // restore last-alert timestamps so restarts don't re-fire crossovers
         rotateLogs();
@@ -2541,12 +2594,14 @@ async function initialize() {
             fs.mkdirSync(ML_DATA_DIR, { recursive: true });
         }
 
-        // Check if TensorFlow.js is available
-        ML_ENABLED = checkTensorFlowAvailability() && ML_ENABLED;
-
-        // Load ML training data if ML is enabled
         if (ML_ENABLED) {
-            loadTrainingData();
+            // Check TensorFlow only when ML is enabled in settings
+            ML_ENABLED = checkTensorFlowAvailability();
+            if (ML_ENABLED) {
+                loadTrainingData();
+            }
+        } else {
+            log('ML is disabled in settings; skipping TensorFlow availability check', 'info');
         }
 
         // Send startup message
