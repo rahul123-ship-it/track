@@ -79,7 +79,7 @@ Ema_Tracker/
 ┌─────────────────────────────────────────────┐
 │          ALERT SYSTEM                       │
 │  shouldAlert() → cooldown check → send:     │
-│    • Telegram message with TradingView link │
+│    • Telegram message with Delta Exchange link │
 │    • Windows toast with full signal info    │
 │    • Console + file log                     │
 └─────────────────────────────────────────────┘

@@ -194,11 +194,9 @@ async function safeSendAlert(chatId, text, opts) {
     }
 }
 
-// Build a TradingView chart URL for a given symbol (handles non-USDT pairs gracefully)
-function getTradingViewUrl(symbol) {
-    const safeSymbol = symbol.replace(/[^A-Z0-9]/g, '');
-    const base = safeSymbol.endsWith('USDT') ? safeSymbol.slice(0, -4) : safeSymbol;
-    return `https://www.tradingview.com/chart/?symbol=BINANCE:${base}USDT.P`;
+// Build a chart URL for a given symbol on Delta Exchange India
+function getChartUrl(symbol) {
+    return `https://india.delta.exchange/trade/${symbol}`;
 }
 // Returns a human-readable timeframe label for the current mode.
 // Dual mode doesn't have a single TF, so we reflect the actual tf arg or show both.
@@ -509,7 +507,7 @@ async function getFuturesPairs() {
 // Alert when new pairs cross the volume threshold
 async function alertNewHighVolumePairs(newPairs) {
     for (const pair of newPairs) {
-        const tradingViewUrl = getTradingViewUrl(pair.symbol);
+        const chartUrl = getChartUrl(pair.symbol);
         const message = `🔔 <b>NEW HIGH VOLUME PAIR DETECTED</b>\n\n` +
             `<b>Symbol:</b> ${pair.symbol}\n` +
             `<b>Volume:</b> ${formatVolume(pair.volume)}\n` +
@@ -517,7 +515,7 @@ async function alertNewHighVolumePairs(newPairs) {
             `<b>24h Change:</b> ${pair.change.toFixed(2)}%\n` +
             `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
             `This pair has been added to the monitoring list.\n\n` +
-            `<a href="${tradingViewUrl}">View Chart on TradingView</a>`;
+            `<a href="${chartUrl}">View Chart on Delta Exchange</a>`;
 
         try {
             await bot.sendMessage(TELEGRAM_CHAT_ID, message, { 
@@ -530,7 +528,7 @@ async function alertNewHighVolumePairs(newPairs) {
                 `🔔 New High Volume Pair: ${pair.symbol}`,
                 `Volume: ${formatVolume(pair.volume)}  Price: ${formatPrice(pair.price)}\n24h Change: ${pair.change.toFixed(2)}%  Added to monitoring`,
                 'info',
-                tradingViewUrl
+                chartUrl
             );
 
             log(`New high volume pair alert sent for ${pair.symbol} with volume ${formatVolume(pair.volume)}`, 'success');
@@ -748,8 +746,8 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
         const stats = await get24HrStats(symbol);
         const oi = await getOIDelta(symbol).catch(() => null);
 
-        // Create a TradingView link
-        const tradingViewUrl = getTradingViewUrl(symbol);
+        // Create a chart link
+        const chartUrl = getChartUrl(symbol);
 
         const oiLine = oi
             ? `<b>OI Delta:</b> ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '\u{1F4C8} new money (stronger)' : oi.deltaPercent <= -0.5 ? '\u{1F4C9} liquidation (weaker)' : '\u2192 neutral'}\n`
@@ -764,7 +762,7 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
             oiLine +
             `<b>Timeframe:</b> ${activeTimeframeLabel()}\n\n` +
             `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-            `<a href="${tradingViewUrl}">View Chart on TradingView</a>`;
+            `<a href="${chartUrl}">View Chart on Delta Exchange</a>`;
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'HTML',
@@ -772,12 +770,12 @@ async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
         });
 
         // Show desktop notification — mirrors Telegram message content
-        // Clicking the toast opens the TradingView chart in the browser
+        // Clicking the toast opens the chart in the browser
         showDesktopNotification(
             `${crossType === 'up' ? '🟢 BULLISH' : '🔴 BEARISH'} — ${symbol}`,
             `Price: ${formattedPrice}  EMA(${EMA_PERIOD}): ${formattedEma}\nDiff: ${difference.toFixed(2)}%  24h: ${stats.priceChangePercent}%\nVol: ${formatVolume(stats.quoteVolume)}  TF: ${TIMEFRAME}`,
             crossType === 'up' ? 'info' : 'warning',
-            tradingViewUrl
+            chartUrl
         );
 
         log(`Telegram alert sent for ${symbol} (${crossType})`, 'success');
@@ -1575,8 +1573,8 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, t
         const stats = await get24HrStats(symbol);
         const oi = await getOIDelta(symbol).catch(() => null);
 
-        // TradingView link
-        const tradingViewUrl = getTradingViewUrl(symbol);
+        // Chart link
+        const chartUrl = getChartUrl(symbol);
 
         const oiLine = oi
             ? `<b>OI Delta:</b> ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '\u{1F4C8} new money (stronger)' : oi.deltaPercent <= -0.5 ? '\u{1F4C9} liquidation (weaker)' : '\u2192 neutral'}\n`
@@ -1592,7 +1590,7 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, t
             oiLine +
             `<b>Timeframe:</b> ${activeTimeframeLabel(tf)}\n\n` +
             `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-            `<a href="${tradingViewUrl}">View Chart on TradingView</a>`;
+            `<a href="${chartUrl}">View Chart on Delta Exchange</a>`;
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'HTML',
@@ -1600,12 +1598,12 @@ async function sendDualEmaAlert(symbol, crossType, price, ema9, ema15, spread, t
         });
 
         // Show desktop notification — mirrors Telegram message content
-        // Clicking the toast opens the TradingView chart in the browser
+        // Clicking the toast opens the chart in the browser
         showDesktopNotification(
             `${crossType === 'up' ? '🟢 EMA 9/15 BULL' : '🔴 EMA 9/15 BEAR'}${tfLabel} — ${symbol}`,
             `EMA(9): ${formatPrice(ema9)}  EMA(15): ${formatPrice(ema15)}\nSpread: ${spread.toFixed(4)}%  24h: ${stats.priceChangePercent}%\nVol: ${formatVolume(stats.quoteVolume)}  TF: ${tf || TIMEFRAME}`,
             crossType === 'up' ? 'info' : 'warning',
-            tradingViewUrl
+            chartUrl
         );
 
         log(`Dual EMA alert sent for ${symbol}${tfLabel} (${crossType})`, 'success');
@@ -2118,7 +2116,7 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
             confidenceEmoji = prediction > 0 ? '📈' : '📉'; // Moderate signal
         }
 
-        const tradingViewUrl = getTradingViewUrl(symbol);
+        const chartUrl = getChartUrl(symbol);
 
         const oiLine = oi
             ? `<b>OI Delta:</b> ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '📈 new money (stronger)' : oi.deltaPercent <= -0.5 ? '📉 liquidation (weaker)' : '→ neutral'}\n`
@@ -2134,7 +2132,7 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
             `<b>Timeframe:</b> ${activeTimeframeLabel()}\n` +
             `<b>ML Prediction:</b> ${confidenceEmoji} ${prediction.toFixed(2)}% (24h)\n\n` +
             `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-            `<a href="${tradingViewUrl}">View Chart on TradingView</a>`;
+            `<a href="${chartUrl}">View Chart on Delta Exchange</a>`;
 
         await safeSendAlert(TELEGRAM_CHAT_ID, message, {
             parse_mode: 'HTML',
@@ -2142,12 +2140,12 @@ async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference
         });
 
         // Show desktop notification — mirrors Telegram message content
-        // Clicking the toast opens the TradingView chart in the browser
+        // Clicking the toast opens the chart in the browser
         showDesktopNotification(
             `${crossType === 'up' ? '🟢 BULLISH+ML' : '🔴 BEARISH+ML'} — ${symbol}`,
             `Price: ${formattedPrice}  EMA(${EMA_PERIOD}): ${formattedEma}\nDiff: ${difference.toFixed(2)}%  ML: ${confidenceEmoji} ${prediction.toFixed(2)}% (24h)\n24h: ${stats.priceChangePercent}%  TF: ${TIMEFRAME}`,
             crossType === 'up' ? 'info' : 'warning',
-            tradingViewUrl
+            chartUrl
         );
 
         log(`ML-enhanced Telegram alert sent for ${symbol} (${crossType})`, 'success');
