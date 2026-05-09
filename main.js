@@ -1,4 +1,4 @@
-require('dotenv').config();
+﻿require('dotenv').config();
 const axios = require('axios');
 const colors = require('colors');
 const figlet = require('figlet');
@@ -19,8 +19,8 @@ let lastCandleTime = null; // Timestamp of the most recently processed closed ca
 // ML configuration
 let ML_ENABLED = false;
 
-// Dual EMA crossover mode: when true, alerts on EMA(9) vs EMA(15) crossover instead of price vs single EMA
-let DUAL_EMA_MODE = false;
+// Dual EMA crossover mode: always true — EMA(9) vs EMA(15) only. Single-EMA code is in src/single_ema_engine.js.
+let DUAL_EMA_MODE = true;
 // Optional fast timeframe addon for dual mode: include 1m+3m alongside 5m+15m
 let INCLUDE_FAST_TFS = (process.env.INCLUDE_FAST_TFS || 'true').toLowerCase() === 'true';
 const FORCE_ALL_DUAL_TFS = (process.env.FORCE_ALL_DUAL_TFS || 'true').toLowerCase() === 'true';
@@ -81,24 +81,26 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
   // Add specific error handlers
 bot.on('polling_error', (error) => {
     log(`Telegram polling error: ${error.message}`, 'error');
-    // Skip auto-reconnect while a graceful reconnect is running
-    if (isReconnecting) return;
+    // Skip auto-reconnect while a Telegram reconnect is already in progress.
+    // Uses dedicated isTelegramReconnecting so the WS heartbeat (isReconnecting)
+    // continues to repair dead pool connections during Telegram outages.
+    if (isTelegramReconnecting) return;
 
     // Restart polling after a delay if connection was reset
     if (error.code === 'ECONNRESET' || error.code === 'EFATAL') {
-      log('Connection reset, restarting polling in 10 seconds...', 'warning');
-      isReconnecting = true;
+      log('Connection reset, restarting Telegram polling in 10 seconds...', 'warning');
+      isTelegramReconnecting = true;
       setTimeout(() => {
         try {
           bot.stopPolling();
           setTimeout(() => {
             bot.startPolling();
-            isReconnecting = false;
+            isTelegramReconnecting = false;
             log('Telegram polling restarted successfully', 'success');
           }, 1000);
         } catch (e) {
-          isReconnecting = false;
-          log(`Failed to restart polling: ${e.message}`, 'error');
+          isTelegramReconnecting = false;
+          log(`Failed to restart Telegram polling: ${e.message}`, 'error');
         }
       }, 10000);
     }
@@ -155,6 +157,10 @@ const ema9Cache = new Map(); // Cache for EMA(9) values (dual mode)
 const ema15Cache = new Map(); // Cache for EMA(15) values (dual mode)
 const lastWsCandleTs = new Map(); // Tracks last seen WS event timestamp per symbol/tf (diagnostic only)
 const oiSnapshotCache = new Map(); // Cache latest OI per symbol for delta calculation
+// Caches the latest bulk ticker snapshot from Delta's /v2/tickers endpoint.
+// Populated every time getFuturesPairs() runs; used by get24HrStats() to avoid
+// per-symbol REST round-trips on every alert (the main source of alert latency).
+const tickerCache = new Map();
 // Composite cache key for dual-TF mode — "BTCUSDT_5m" / "BTCUSDT_15m"
 function tfKey(symbol, tf) { return `${symbol}_${tf}`; }
 
@@ -249,7 +255,14 @@ const VALID_VOLUMES    = [2_000_000, 5_000_000, 10_000_000, 20_000_000, 50_000_0
 const VALID_TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h'];
 const VALID_EMA_PERIODS = [50, 100, 200];
 const ALERT_TRACE_ENABLED = (process.env.ALERT_TRACE || 'false').toLowerCase() === 'true';
-let isReconnecting = false; // Prevents stacked reconnectionsduring graceful restarts
+let isReconnecting = false; // Prevents stacked WS reconnections during graceful restarts
+// Separate Telegram-specific reconnect flag so WS heartbeat is never blocked by a
+// Telegram polling recovery (the shared flag caused WS dead pools to stay dead).
+let isTelegramReconnecting = false;
+// Guard that prevents two periodic checkEMACross() calls from running at the same
+// time. Without it, slow REST chunks can let the next setInterval tick fire and
+// both chains race into shouldAlert(), consuming cooldowns with no alert sent.
+let periodicCheckRunning = false;
 let monitoringInterval = null; // Reference to the periodic check interval
 
 // Prevent destructive commands from being spammed concurrently.
@@ -284,10 +297,25 @@ function traceAlert(message) {
 // Telegram circuit breaker — pauses alert sends after 5 consecutive failures
 let _tgFailCount = 0;
 let _tgPausedUntil = 0;
+// Tracks how many crossover alerts were dropped during a circuit-open window.
+// Reported to the user as a single recovery message when the circuit closes.
+let _tgMissedAlerts = 0;
 async function safeSendAlert(chatId, text, opts) {
     if (Date.now() < _tgPausedUntil) {
-        log('Telegram circuit open — alert suppressed', 'warning');
+        _tgMissedAlerts++;
+        log(`Telegram circuit open — alert suppressed (${_tgMissedAlerts} missed this window)`, 'warning');
         return;
+    }
+    // Circuit just recovered — tell the user how many signals were silently dropped
+    // so they know to check charts manually for missed entries/exits.
+    if (_tgMissedAlerts > 0) {
+        const missed = _tgMissedAlerts;
+        _tgMissedAlerts = 0;
+        bot.sendMessage(
+            chatId,
+            `⚠️ <b>Telegram connection recovered.</b>\n${missed} crossover alert(s) were suppressed during the connectivity pause.\nCheck charts manually for missed signals.`,
+            { parse_mode: 'HTML' }
+        ).catch(() => {});
     }
     try {
         await bot.sendMessage(chatId, text, opts);
@@ -573,22 +601,33 @@ function formatPrice(price) {
     return price.toFixed(2);
 }
 
-// Function to get 24hr stats for a symbol
+// Function to get 24hr stats for a symbol.
+// Uses tickerCache populated by getFuturesPairs() first; falls back to a direct API call on cache miss.
 async function get24HrStats(symbol) {
     try {
+        // Fast path: use cached bulk ticker (avoids per-symbol REST round-trip on every alert)
+        const cached = tickerCache.get(symbol);
+        if (cached) {
+            return {
+                priceChangePercent: parseFloat(cached.ltp_change_24h || 0).toFixed(2),
+                quoteVolume: parseFloat(cached.turnover_usd || cached.turnover || 0)
+            };
+        }
+        // Cache miss (rare, e.g. symbol discovered before first getFuturesPairs cycle)// it could be happrn so add a checkpoint for that I don't want edge cases to cause alert failures
         await enforceRateLimit();
         const response = await axios.get(`${DELTA_REST_BASE_URL}/tickers/${symbol}`, {
             timeout: 10000
         });
         const ticker = response?.data?.result;
         if (!ticker) throw new Error(`Ticker not found for ${symbol}`);
+        tickerCache.set(symbol, ticker);
         return {
             priceChangePercent: parseFloat(ticker.ltp_change_24h || 0).toFixed(2),
             quoteVolume: parseFloat(ticker.turnover_usd || ticker.turnover || 0)
         };
     } catch (error) {
         log(`Error fetching 24hr stats for ${symbol}: ${error.message}`, 'error');
-        return { priceChangePercent: '0.00', quoteVolume: '0' };
+        return { priceChangePercent: '0.00', quoteVolume: 0 };
     }
 }
 
@@ -606,6 +645,12 @@ async function getFuturesPairs() {
         const tickers = response?.data?.result;
         if (!Array.isArray(tickers)) throw new Error('Unexpected Delta tickers response shape');
         const newPairs = [];
+
+        // Cache ALL tickers from this bulk response so get24HrStats() can return
+        // data instantly without a separate per-symbol REST call per alert.
+        for (const t of tickers) {
+            if (t.symbol) tickerCache.set(t.symbol, t);
+        }
 
         const pairs = tickers
             .filter(ticker => {
@@ -652,6 +697,11 @@ async function getFuturesPairs() {
 // Alert when new pairs cross the volume threshold
 async function alertNewHighVolumePairs(newPairs) {
     for (const pair of newPairs) {
+        // Subscribe to WebSocket FIRST, independent of Telegram delivery.
+        // If Telegram fails, coverage is still established so crossover alerts
+        // on this symbol are not permanently lost.
+        subscribeSymbolToPool(pair.symbol);
+
         const chartUrl = getChartUrl(pair.symbol);
         const message = `🔔 <b>NEW HIGH VOLUME PAIR DETECTED</b>\n\n` +
             `<b>Symbol:</b> ${pair.symbol}\n` +
@@ -677,9 +727,6 @@ async function alertNewHighVolumePairs(newPairs) {
             );
 
             log(`New high volume pair alert sent for ${pair.symbol} with volume ${formatVolume(pair.volume)}`, 'success');
-
-            // Subscribe the new pair to the existing pool
-            subscribeSymbolToPool(pair.symbol);
         } catch (error) {
             log(`Error sending new pair alert for ${pair.symbol}: ${error.message}`, 'error');
         }
@@ -880,63 +927,10 @@ async function getOIDelta(symbol) {
 }
 
 // Send Telegram notification with enhanced formatting
-async function sendTelegramAlert(symbol, crossType, price, ema, difference) {
-    try {
-        const emoji = crossType === 'up' ? '🟢' : '🔴';
-        const signal = crossType === 'up' ? 'BULLISH SIGNAL' : 'BEARISH SIGNAL';
-        const formattedPrice = formatPrice(price);
-        const formattedEma = formatPrice(ema);
-
-        // Get 24hr stats for the symbol
-        const stats = await get24HrStats(symbol);
-        const oi = await getOIDelta(symbol).catch(() => null);
-
-        // Create a chart link
-        const chartUrl = getChartUrl(symbol);
-
-        const oiLine = oi
-            ? `<b>OI Delta:</b> ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '\u{1F4C8} new money (stronger)' : oi.deltaPercent <= -0.5 ? '\u{1F4C9} liquidation (weaker)' : '\u2192 neutral'}\n`
-            : '';
-        const message = `${emoji} <b>${signal}</b> ${emoji}\n\n` +
-            `<b>Symbol:</b> ${symbol}\n` +
-            `<b>Price:</b> ${formattedPrice}\n` +
-            `<b>EMA(${EMA_PERIOD}):</b> ${formattedEma}\n` +
-            `<b>Difference:</b> ${difference.toFixed(2)}%\n` +
-            `<b>24h Change:</b> ${stats.priceChangePercent}%\n` +
-            `<b>24h Volume:</b> ${formatVolume(stats.quoteVolume)}\n` +
-            oiLine +
-            `<b>Timeframe:</b> ${activeTimeframeLabel()}\n\n` +
-            `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-            `<a href="${getHtmlSafeUrl(chartUrl)}">View Chart on TradingView</a>`;
-
-        await safeSendAlert(TELEGRAM_CHAT_ID, message, {
-            parse_mode: 'HTML',
-            disable_web_page_preview: true
-        });
-
-        // Show desktop notification — mirrors Telegram message content
-        // Clicking the toast opens the chart in the browser
-        showDesktopNotification(
-            `${crossType === 'up' ? '🟢 BULLISH' : '🔴 BEARISH'} — ${symbol}`,
-            `Price: ${formattedPrice}  EMA(${EMA_PERIOD}): ${formattedEma}\nDiff: ${difference.toFixed(2)}%  24h: ${stats.priceChangePercent}%\nVol: ${formatVolume(stats.quoteVolume)}  TF: ${TIMEFRAME}`,
-            crossType === 'up' ? 'info' : 'warning',
-            chartUrl
-        );
-
-        log(`Telegram alert sent for ${symbol} (${crossType})`, 'success');
-    } catch (error) {
-        log(`Error sending Telegram message: ${error.message}`, 'error');
-
-        // Retry with simpler message if parse_mode might be the issue
-        try {
-            const simpleMessage = `${crossType === 'up' ? '🟢 BULLISH' : '🔴 BEARISH'} SIGNAL: ${symbol} at ${formatPrice(price)}`;
-            await safeSendAlert(TELEGRAM_CHAT_ID, simpleMessage);
-            log(`Sent simplified alert for ${symbol} after error`, 'warning');
-        } catch (retryError) {
-            log(`Failed to send even simplified message: ${retryError.message}`, 'error');
-        }
-    }
-}
+// ─── Single-EMA alert (price vs EMA 50/100/200) ─────────────────────────────
+// Moved to src/single_ema_engine.js. Re-enable by importing createSingleEmaEngine.
+// async function sendTelegramAlert(symbol, crossType, price, ema, difference) { ... }
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Check if we should alert for this symbol based on direction change and cooldown
 // tf — '5m' or '15m' in dual-TF mode; '' for single-mode (uses old key format)
@@ -1257,14 +1251,14 @@ async function processClosedCandle(symbol, kline, tf = null) {
                 }
             }
         } else {
-            // Single EMA mode — update incrementally
+            // ── Single-EMA mode (price vs EMA 50/100/200) ── DISABLED — see src/single_ema_engine.js ──
+            // Uncomment the block below when re-enabling single-EMA mode:
+            /*
             const updated = updateEMA(symbol, newKline.close, isNewCandle);
             if (!updated) {
                 const freshEma = calculateEMA(closes, EMA_PERIOD);
                 emaCache.set(symbol, freshEma);
             }
-
-            // Only evaluate crossover when a candle is confirmed closed.
             if (justClosedKlines && justClosedKlines.length >= EMA_PERIOD + 1) {
                 const closedCloses = justClosedKlines.map(k => k.close);
                 const closedEma = calculateEMA(closedCloses, EMA_PERIOD);
@@ -1276,14 +1270,11 @@ async function processClosedCandle(symbol, kline, tf = null) {
                     await checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA);
                 }
             }
+            */
         }
 
-        // Collect data for ML training ONLY on candle close (when a new candle bucket starts)
-        // to avoid writing 100s of identical data points per candle to disk.
-        if (justClosedKlines && ML_ENABLED && !DUAL_EMA_MODE && mlRuntime) {
-            const emaValues = emaCache.get(symbol) || [];
-            await mlRuntime.onClosedCandleForTraining(symbol, justClosedKlines, emaValues, deferredInsert, deferredUpdates);
-        }
+        // ML training: only in dual mode (single-EMA ML path also disabled)
+        // if (justClosedKlines && ML_ENABLED && !DUAL_EMA_MODE && mlRuntime) { ... }
     } catch (error) {
         log(`Error processing closed candle for ${symbol}: ${error.message}`, 'error');
     }
@@ -1298,101 +1289,10 @@ function exportAllDataToCSV() {
     if (mlRuntime) mlRuntime.exportAllDataToCSV();
 }
 
-// Check for crossover and send alerts if needed with ML prediction
-async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA) {
-    try {
-        if (![prevPrice, lastPrice, prevEMA, lastEMA].every(Number.isFinite) || prevEMA === 0 || lastEMA === 0) {
-            traceAlert(`${symbol} single-mode skipped: invalid numeric inputs`);
-            return;
-        }
-
-        // Determine current state (above or below EMA)
-        const currentState = lastPrice > lastEMA ? 'above' : 'below';
-        const difference = (lastPrice - lastEMA) / lastEMA * 100;
-
-        // Get ML prediction if available
-        let prediction = null;
-        if (ML_ENABLED) {
-            try {
-                prediction = await predictPriceMovement(symbol, lastPrice, lastEMA, difference);
-            } catch (predictionError) {
-                log(`Error getting prediction for ${symbol}: ${predictionError.message}`, 'warning');
-                // Continue without prediction
-            }
-        }
-
-        // Upward crossover: price crossing from below to above EMA (with minimum margin)
-        if (prevPrice < prevEMA && lastPrice > lastEMA && (lastPrice - lastEMA) / lastEMA > MIN_CROSS_PCT) {
-            traceAlert(`${symbol} single-mode bullish candidate diff=${difference.toFixed(4)}%`);
-            console.log('\n');
-            console.log('▲'.green + ' UPWARD CROSSOVER '.white.bgGreen + ' ' + symbol.bold);
-            console.log(`  Previous Price: ${formatPrice(prevPrice).gray} → Current Price: ${formatPrice(lastPrice).green}`);
-            console.log(`  Previous EMA: ${formatPrice(prevEMA).gray} → Current EMA: ${formatPrice(lastEMA).cyan}`);
-            console.log(`  Difference: ${difference.toFixed(2)}%`.yellow);
-
-            if (prediction !== null) {
-                console.log(`  ML Prediction: ${prediction.toFixed(2)}% expected change`.cyan);
-            }
-
-            // CRITICAL: Check flat EMA BEFORE calling shouldAlert() to avoid wasting cooldown
-            const flatCheck = isEmaFlat(symbol, '', false); // single-mode, useDualEma = false
-
-            if (flatCheck.isFlat) {
-                // Update state so next real crossover is detected, but don't consume cooldown
-                coinStates.set(symbol, currentState);
-                traceAlert(`${symbol} single-mode bullish suppressed: ${flatCheck.reason}`);
-                return;
-            }
-
-            if (shouldAlert(symbol, currentState)) {
-                if (prediction !== null) {
-                    await sendTelegramAlertWithML(symbol, 'up', lastPrice, lastEMA, difference, prediction);
-                } else {
-                    await sendTelegramAlert(symbol, 'up', lastPrice, lastEMA, difference);
-                }
-                traceAlert(`${symbol} single-mode bullish alert emitted`);
-            }
-        }
-        // Downward crossover: price crossing from above to below EMA (with minimum margin)
-        else if (prevPrice > prevEMA && lastPrice < lastEMA && (lastEMA - lastPrice) / lastEMA > MIN_CROSS_PCT) {
-            traceAlert(`${symbol} single-mode bearish candidate diff=${difference.toFixed(4)}%`);
-            console.log('\n');
-            console.log('▼'.red + ' DOWNWARD CROSSOVER '.white.bgRed + ' ' + symbol.bold);
-            console.log(`  Previous Price: ${formatPrice(prevPrice).gray} → Current Price: ${formatPrice(lastPrice).red}`);
-            console.log(`  Previous EMA: ${formatPrice(prevEMA).gray} → Current EMA: ${formatPrice(lastEMA).cyan}`);
-            console.log(`  Difference: ${difference.toFixed(2)}%`.yellow);
-
-            if (prediction !== null) {
-                console.log(`  ML Prediction: ${prediction.toFixed(2)}% expected change`.cyan);
-            }
-
-            // CRITICAL: Check flat EMA BEFORE calling shouldAlert() to avoid wasting cooldown
-            const flatCheck = isEmaFlat(symbol, '', false); // single-mode, useDualEma = false
-
-            if (flatCheck.isFlat) {
-                // Update state so next real crossover is detected, but don't consume cooldown
-                coinStates.set(symbol, currentState);
-                traceAlert(`${symbol} single-mode bearish suppressed: ${flatCheck.reason}`);
-                return;
-            }
-
-            if (shouldAlert(symbol, currentState)) {
-                if (prediction !== null) {
-                    await sendTelegramAlertWithML(symbol, 'down', lastPrice, lastEMA, difference, prediction);
-                } else {
-                    await sendTelegramAlert(symbol, 'down', lastPrice, lastEMA, difference);
-                }
-                traceAlert(`${symbol} single-mode bearish alert emitted`);
-            }
-        } else {
-            // Update state even if no crossover
-            coinStates.set(symbol, currentState);
-            traceAlert(`${symbol} single-mode no cross; state=${currentState} diff=${difference.toFixed(4)}%`);
-        }
-    } catch (error) {
-        log(`Error checking for crossover for ${symbol}: ${error.message}`, 'error');
-    }
-}
+// ─── Single-EMA crossover detection (price vs EMA 50/100/200) ──────────────────────
+// Moved to src/single_ema_engine.js. Re-enable by importing createSingleEmaEngine.
+// async function checkForCrossover(symbol, prevPrice, lastPrice, prevEMA, lastEMA) { ... }
+// ───────────────────────────────────────────────────────────────────────────
 
 // Check for dual EMA(9) vs EMA(15) crossover
 // tf — '5m' or '15m' in dual-TF mode; '' in legacy single-TF mode
@@ -1697,7 +1597,9 @@ async function checkEMACross({ emitAlerts = false } = {}) {
                     coinStates.set(tfKey(pair, tf), a9.at(-1) > a15.at(-1) ? 'ema9_above' : 'ema9_below');
                 }
             } else {
-                // Single EMA crossover check (price vs EMA)
+                // ── Single-EMA crossover check (price vs EMA 50/100/200) ── DISABLED — see src/single_ema_engine.js ──
+                // Uncomment the block below when re-enabling single-EMA mode:
+                /*
                 const closes = klines.map(k => k.close);
                 const ema = calculateEMA(closes, EMA_PERIOD);
 
@@ -1716,6 +1618,7 @@ async function checkEMACross({ emitAlerts = false } = {}) {
                 } else {
                     coinStates.set(pair, lastPrice > lastEMA ? 'above' : 'below');
                 }
+                */
             }
         }
 
@@ -1743,67 +1646,10 @@ async function trainAllModels(chatId) {
     if (mlRuntime) await mlRuntime.trainAllModels(chatId);
 }
 
-// Enhanced Telegram alert with ML confidence
-async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference, prediction) {
-    try {
-        const emoji = crossType === 'up' ? '🟢' : '🔴';
-        const signal = crossType === 'up' ? 'BULLISH SIGNAL' : 'BEARISH SIGNAL';
-        const formattedPrice = formatPrice(price);
-        const formattedEma = formatPrice(ema);
-
-        // Get 24hr stats for the symbol
-        const stats = await get24HrStats(symbol);
-        const oi = await getOIDelta(symbol).catch(() => null);
-
-        // Format ML prediction with confidence emoji
-        let confidenceEmoji = '⚠️'; // Neutral/uncertain
-        if (Math.abs(prediction) > 3) {
-            confidenceEmoji = prediction > 0 ? '🔥' : '❄️'; // Strong signal
-        } else if (Math.abs(prediction) > 1) {
-            confidenceEmoji = prediction > 0 ? '📈' : '📉'; // Moderate signal
-        }
-
-        const chartUrl = getChartUrl(symbol);
-
-        const oiLine = oi
-            ? `<b>OI Delta:</b> ${oi.deltaPercent >= 0 ? '+' : ''}${oi.deltaPercent.toFixed(2)}% ${oi.deltaPercent >= 0.5 ? '📈 new money (stronger)' : oi.deltaPercent <= -0.5 ? '📉 liquidation (weaker)' : '→ neutral'}\n`
-            : '';
-        const message = `${emoji} <b>${signal}</b> ${emoji}\n\n` +
-            `<b>Symbol:</b> ${symbol}\n` +
-            `<b>Price:</b> ${formattedPrice}\n` +
-            `<b>EMA(${EMA_PERIOD}):</b> ${formattedEma}\n` +
-            `<b>Difference:</b> ${difference.toFixed(2)}%\n` +
-            `<b>24h Change:</b> ${stats.priceChangePercent}%\n` +
-            `<b>24h Volume:</b> ${formatVolume(stats.quoteVolume)}\n` +
-            oiLine +
-            `<b>Timeframe:</b> ${activeTimeframeLabel()}\n` +
-            `<b>ML Prediction:</b> ${confidenceEmoji} ${prediction.toFixed(2)}% (24h)\n\n` +
-            `<b>Time:</b> ${new Date().toLocaleString()}\n\n` +
-            `<a href="${getHtmlSafeUrl(chartUrl)}">View Chart on TradingView</a>`;
-
-        await safeSendAlert(TELEGRAM_CHAT_ID, message, {
-            parse_mode: 'HTML',
-            disable_web_page_preview: true
-        });
-
-        // Show desktop notification — mirrors Telegram message content
-        // Clicking the toast opens the chart in the browser
-        showDesktopNotification(
-            `${crossType === 'up' ? '🟢 BULLISH+ML' : '🔴 BEARISH+ML'} — ${symbol}`,
-            `Price: ${formattedPrice}  EMA(${EMA_PERIOD}): ${formattedEma}\nDiff: ${difference.toFixed(2)}%  ML: ${confidenceEmoji} ${prediction.toFixed(2)}% (24h)\n24h: ${stats.priceChangePercent}%  TF: ${TIMEFRAME}`,
-            crossType === 'up' ? 'info' : 'warning',
-            chartUrl
-        );
-
-        log(`ML-enhanced Telegram alert sent for ${symbol} (${crossType})`, 'success');
-    } catch (error) {
-        log(`Error sending ML-enhanced Telegram message: ${error.message}`, 'error');
-
-        // Fall back to regular alert
-        await sendTelegramAlert(symbol, crossType, price, ema, difference)
-            .catch(e => log(`Fallback alert failed for ${symbol}: ${e.message}`, 'error'));
-    }
-}
+// ─── Single-EMA ML alert (price vs EMA 50/100/200 + ML) ───────────────────────
+// Moved to src/single_ema_engine.js. Re-enable by importing createSingleEmaEngine.
+// async function sendTelegramAlertWithML(symbol, crossType, price, ema, difference, prediction) { ... }
+// ───────────────────────────────────────────────────────────────────────────
 
 // Command handler
 async function handleMessage(msg) {
@@ -1914,6 +1760,10 @@ async function handleCallbackQuery(callbackQuery) {
     }
 
     try {
+        // Answer Telegram immediately so the button spinner clears.
+        // This MUST happen within ~10 seconds or Telegram shows an error to the user.
+        await bot.answerCallbackQuery(callbackQuery.id).catch(() => {});
+
         if (action === 'status') {
             await sendStatusUpdate(chatId);
         } else if (action === 'settings') {
@@ -1944,10 +1794,13 @@ async function handleCallbackQuery(callbackQuery) {
             saveSettings();
             await sendSettingsMenu(chatId); // show updated menu immediately
             refreshWebSockets(chatId);      // reconnect in background — sends its own progress msgs
+        // ── EMA period selection (single-EMA mode only) ── DISABLED — currently in dual EMA 9/15 mode ──
+        // Uncomment when re-enabling single-EMA mode:
+        /*
         } else if (action.startsWith('ema_')) {
             const newEma = parseInt(action.replace('ema_', ''), 10);
             if (!VALID_EMA_PERIODS.includes(newEma)) {
-                await bot.answerCallbackQuery(callbackQuery.id, { text: '⛔ Invalid EMA period.' });
+                await bot.answerCallbackQuery(callbackQuery.id, { text: '\u26d4 Invalid EMA period.' });
                 return;
             }
             EMA_PERIOD = newEma;
@@ -1960,7 +1813,17 @@ async function handleCallbackQuery(callbackQuery) {
             coinStates.clear();
             await sendSettingsMenu(chatId); // show updated menu immediately
             refreshWebSockets(chatId);      // reconnect in background — sends its own progress msgs
+        */
         } else if (action === 'toggle_dual_ema') {
+            // Hard-reject the toggle when the env lock is active.Allowing it would set DUAL_EMA_MODE=false and disable ALL crossover alerts silently — the single-EMA path is commented out, so nothing fires.
+            if (FORCE_ALL_DUAL_TFS) {
+                await bot.sendMessage(
+                    chatId,
+                    '🔒 Dual EMA mode is locked ON by environment configuration and cannot be toggled here.'
+                ).catch(() => {});
+                await sendSettingsMenu(chatId);
+                return;
+            }
             DUAL_EMA_MODE = !DUAL_EMA_MODE;
             log(`Dual EMA 9/15 mode ${DUAL_EMA_MODE ? 'enabled' : 'disabled'}`, 'success');
             saveSettings();
@@ -2037,12 +1900,8 @@ async function handleCallbackQuery(callbackQuery) {
             );
             await sendSettingsMenu(chatId);
         }
-
-        // Answer callback query to remove loading state
-        await bot.answerCallbackQuery(callbackQuery.id);
     } catch (error) {
         log(`Error handling callback query: ${error.message}`, 'error');
-        await bot.answerCallbackQuery(callbackQuery.id, { text: 'An error occurred' });
     }
 }
 
@@ -2109,6 +1968,9 @@ function loadSettings() {
             DUAL_EMA_MODE = settings.DUAL_EMA_MODE !== undefined ? settings.DUAL_EMA_MODE : DUAL_EMA_MODE;
             if (typeof settings.INCLUDE_FAST_TFS === 'boolean') INCLUDE_FAST_TFS = settings.INCLUDE_FAST_TFS;
 
+            // FORCE_ALL_DUAL_TFS env var takes hard precedence over any saved setting.Without this guard a stale settings.json with DUAL_EMA_MODE:false silently disables all crossover detection — producing zero alerts with no error shown.
+            if (FORCE_ALL_DUAL_TFS) DUAL_EMA_MODE = true;
+
             log('Settings loaded from file', 'success');
         }
     } catch (error) {
@@ -2148,7 +2010,8 @@ async function sendMainMenu(chatId) {
 // Send status update
 async function sendStatusUpdate(chatId) {
     try {
-        const pairs = await getFuturesPairs();
+        // Use in-memory set — no API call needed just to count tracked pairs
+        const pairsCount = trackedPairs.size;
         const activeWsCount = wsPool.filter(e => e && e.ws && e.ws.readyState === WebSocket.OPEN).length;
 
         const message = `*EMA Tracker Status*\n\n` +
@@ -2156,8 +2019,8 @@ async function sendStatusUpdate(chatId) {
             `- EMA Mode: ${DUAL_EMA_MODE ? `EMA 9/15 Crossover [${getDualEmaTimeframes().join(' + ')}]` : 'Price vs EMA(' + EMA_PERIOD + ')'}\n` +
             `- Timeframe: ${DUAL_EMA_MODE ? getDualEmaTimeframes().join(' + ') : TIMEFRAME}\n` +
             `- Volume Threshold: ${VOLUME_THRESHOLD.toLocaleString()}\n` +
-            `- Monitoring: ${pairs.length} pairs\n` +
-            `- Active WebSockets: ${activeWsCount}/${pairs.length}\n` +
+            `- Monitoring: ${pairsCount} pairs\n` +
+            `- Active WebSockets: ${activeWsCount}/${pairsCount}\n` +
             `- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n` +
             `- Last Check: ${new Date().toLocaleString()}\n\n` +
             `Bot is actively monitoring for ${DUAL_EMA_MODE ? `EMA 9/15 [${getDualEmaTimeframes().join(' + ')}]` : 'EMA'} crossovers in real-time.`;
@@ -2179,67 +2042,48 @@ async function sendStatusUpdate(chatId) {
 
 // Send settings menu with ML toggle and dual EMA option
 async function sendSettingsMenu(chatId) {
-    // Build the EMA mode display string
-    const emaModeText = DUAL_EMA_MODE ? 'EMA 9/15 Cross' : `EMA ${EMA_PERIOD}`;
-
     const keyboard = {
         inline_keyboard: [
             [
-                { text: '1m', callback_data: 'timeframe_1m' },
-                { text: '5m', callback_data: 'timeframe_5m' },
-                { text: '15m', callback_data: 'timeframe_15m' },
-                { text: '1h', callback_data: 'timeframe_1h' },
-                { text: '4h', callback_data: 'timeframe_4h' }
+                { text: 'Vol 2M',   callback_data: 'volume_2000000'   },
+                { text: 'Vol 5M',   callback_data: 'volume_5000000'   }
             ],
             [
-                { text: 'EMA 50', callback_data: 'ema_50' },
-                { text: 'EMA 100', callback_data: 'ema_100' },
-                { text: 'EMA 200', callback_data: 'ema_200' }
+                { text: 'Vol 10M',  callback_data: 'volume_10000000'  },
+                { text: 'Vol 20M',  callback_data: 'volume_20000000'  }
             ],
             [
-                { text: `EMA 9/15 Cross: ${DUAL_EMA_MODE ? 'Enabled ✅' : 'Disabled ❌'}`, callback_data: 'toggle_dual_ema' }
-            ],
-            [
-                {
-                    text: FORCE_ALL_DUAL_TFS
-                        ? 'Fast TF (1m/3m): Locked ON 🔒'
-                        : `Fast TF (1m/3m): ${INCLUDE_FAST_TFS ? 'Enabled ✅' : 'Disabled ❌'}`,
-                    callback_data: 'toggle_fast_tfs'
-                }
-            ],
-            [
-                { text: 'Vol 2M', callback_data: 'volume_2000000' },
-                { text: 'Vol 5M', callback_data: 'volume_5000000' }
-            ],
-            [
-                { text: 'Vol 10M', callback_data: 'volume_10000000' },
-                { text: 'Vol 20M', callback_data: 'volume_20000000' }
-            ],
-            [
-                { text: 'Vol 50M', callback_data: 'volume_50000000' },
+                { text: 'Vol 50M',  callback_data: 'volume_50000000'  },
                 { text: 'Vol 100M', callback_data: 'volume_100000000' }
             ],
             [
                 { text: 'Vol 200M', callback_data: 'volume_200000000' }
             ],
             [
-                { text: `ML: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}`, callback_data: 'toggle_ml' }
+                { text: `ML: ${ML_ENABLED ? 'Enabled \u2705' : 'Disabled \u274c'}`, callback_data: 'toggle_ml' }
             ],
-            [{ text: '🔙 Back to Menu', callback_data: 'menu' }]
+            [{ text: '\ud83d\udd19 Back to Menu', callback_data: 'menu' }]
         ]
     };
 
-    const configText = DUAL_EMA_MODE
-        ? `*Settings*\n\nCurrent Configuration:\n- EMA Mode: 9/15 Crossover ✅\n- Timeframe: ${getDualEmaTimeframes().join(' + ')} (all monitored)\n- Fast TF Add-on: ${FORCE_ALL_DUAL_TFS ? 'Locked ON 🔒 (FORCE_ALL_DUAL_TFS)' : (INCLUDE_FAST_TFS ? 'Enabled ✅' : 'Disabled ❌')}\n- Volume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\n- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n\n_EMA 9/15 monitors all active dual timeframes simultaneously. Single EMA settings (50/100/200) are ignored._\n\nSelect a new setting:`
-        : `*Settings*\n\nCurrent Configuration:\n- EMA: ${EMA_PERIOD}\n- Timeframe: ${TIMEFRAME}\n- Volume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\n- Machine Learning: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}\n\nSelect a new setting:`;
+    // NOTE: Do NOT use Markdown parse_mode here — env variable names (e.g. FORCE_ALL_DUAL_TFS)
+    // contain underscores that Telegram Markdown parser treats as italic delimiters, causing
+    // sendMessage to throw and the settings panel to never appear.
+    const tfs = getDualEmaTimeframes().join(' + ');
+    const fastTfStatus = FORCE_ALL_DUAL_TFS
+        ? 'Locked ON (forced by env)'
+        : (INCLUDE_FAST_TFS ? 'Enabled' : 'Disabled');
 
+    const configText = DUAL_EMA_MODE
+        ? `\u2699\ufe0f Settings\n\nActive Mode: EMA 9/15 Crossover\nTimeframes: ${tfs}\nFast TF Add-on: ${fastTfStatus}\nVolume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\nMachine Learning: ${ML_ENABLED ? 'Enabled' : 'Disabled'}\n\nSelect what to change:`
+        : `\u2699\ufe0f Settings\n\nActive Mode: Price vs EMA ${EMA_PERIOD}\nTimeframe: ${TIMEFRAME}\nVolume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\nMachine Learning: ${ML_ENABLED ? 'Enabled' : 'Disabled'}\n\nSelect what to change:`;
+
+    // No parse_mode: plain text avoids Markdown crash from env var names containing underscores
     await bot.sendMessage(chatId, configText, {
-        parse_mode: 'Markdown',
-        reply_markup: keyboard
+        reply_markup: keyboard,
+        //parse_mode:'Markdown' // why remove it? 
     });
 }
-
-// Send help message
 async function sendHelpMessage(chatId) {
     const helpText = `*EMA Tracker Bot Help*\n\n` +
         `This bot monitors Delta Exchange Futures markets for EMA crossovers and sends alerts when they occur.\n\n` +
@@ -2655,11 +2499,26 @@ async function initialize() {
             }
         }, 60 * 1000); // check every minute
 
-        // Run the check at the specified interval as a backup
-        // This is in addition to the real-time WebSocket monitoring
+        // Run the check at the specified interval as a backup to real-time WebSocket monitoring.
+        // emitAlerts: true — fires alerts for any crossover caught during a WS outage.
+        //   Duplicate suppression is handled by shouldAlert() + ALERT_COOLDOWN, so a
+        //   periodic-check alert that duplicates a WS alert is safely blocked by cooldown.
+        // periodicCheckRunning guard — prevents overlapping executions when a slow REST
+        //   batch (80+ getKlines calls) takes longer than CHECK_INTERVAL to complete.
+        //   Without it, two chains can race into shouldAlert() simultaneously, consuming
+        //   cooldown slots without sending an alert (false suppression).
         monitoringInterval = setInterval(async () => {
-            log('Running periodic check as backup to WebSockets...', 'info');
-            await checkEMACross({ emitAlerts: false });
+            if (periodicCheckRunning) {
+                log('Periodic check already running — skipping this cycle to prevent overlap', 'warning');
+                return;
+            }
+            periodicCheckRunning = true;
+            try {
+                log('Running periodic check as backup to WebSockets...', 'info');
+                await checkEMACross({ emitAlerts: true });
+            } finally {
+                periodicCheckRunning = false;
+            }
         }, CHECK_INTERVAL);
 
         log(`Initialization complete. Bot is now monitoring in real-time via WebSockets${ML_ENABLED ? ' with ML enhancement' : ''}.`, 'success');
