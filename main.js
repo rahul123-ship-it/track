@@ -22,18 +22,20 @@ let ML_ENABLED = false;
 // Dual EMA crossover mode: always true — EMA(9) vs EMA(15) only. Single-EMA code is in src/single_ema_engine.js.
 let DUAL_EMA_MODE = true;
 // Two independent timeframe groups for dual EMA 9/15 crossover mode.
-// FAST group: 1m + 3m  |  SLOW group: 5m + 15m
-// Both can be ON at the same time (default). Each is toggled via the Settings menu.
+// FAST group: 1m + 3m  |  SLOW group: 5m + 15m  |  LONG group: 1h + 4h (all Delta pairs)
+// Each is toggled independently via the Settings menu. Default: fast+slow ON, long OFF.
 let INCLUDE_FAST_TFS = (process.env.INCLUDE_FAST_TFS || 'true').toLowerCase() === 'true';
-let ENABLE_SLOW_GROUP = true; // 5m + 15m group — separate toggle, on by default
-const FORCE_ALL_DUAL_TFS = (process.env.FORCE_ALL_DUAL_TFS || 'true').toLowerCase() === 'true';
+let ENABLE_SLOW_GROUP = true;   // 5m + 15m group
+let ENABLE_LONG_GROUP = false;  // 1h + 4h group — monitors ALL Delta Exchange perpetual futures
+let longGroupSymbols = new Set(); // tracks symbols added exclusively for the 1h+4h group
+const FORCE_ALL_DUAL_TFS = (process.env.FORCE_ALL_DUAL_TFS || 'false').toLowerCase() === 'true';
 
 // Configuration
 let EMA_PERIOD = parseInt(process.env.EMA_PERIOD, 10) || 200;
 let TIMEFRAME = process.env.TIMEFRAME || '15m';
-let VOLUME_THRESHOLD = parseInt(process.env.VOLUME_THRESHOLD, 10) || 100_000_000;
+let VOLUME_THRESHOLD = parseInt(process.env.VOLUME_THRESHOLD, 10) || 2_000_000;
 const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL, 10) || 5 * 60 * 1000; // 5 minutes
-const ALERT_COOLDOWN = parseInt(process.env.ALERT_COOLDOWN, 10) || 1 * 60 * 1000; // 1 minute cooldown for alerts
+const ALERT_COOLDOWN = parseInt(process.env.ALERT_COOLDOWN, 10) || 15 * 60 * 1000; // 15 minute cooldown for alerts
 
 // Flat EMA filter configuration - suppresses alerts during sideways markets
 const FLAT_EMA_PERIODS = 5; // Number of candles to look back for slope calculation
@@ -395,12 +397,13 @@ function isSlowGroupActive() {
 }
 
 function getDualEmaTimeframes() {
-    if (FORCE_ALL_DUAL_TFS) return ['1m', '3m', '5m', '15m'];
+    if (FORCE_ALL_DUAL_TFS) return ['1m', '3m', '5m', '15m', '1h', '4h'];
     const tfs = [];
     if (INCLUDE_FAST_TFS) tfs.push('1m', '3m');
     if (ENABLE_SLOW_GROUP) tfs.push('5m', '15m');
-    // Safety fallback: always return at least the slow group so alerts never stop completely
-    return tfs.length ? tfs : ['5m', '15m'];
+    if (ENABLE_LONG_GROUP) tfs.push('1h', '4h');
+    // Empty array is intentional — means all groups are OFF (monitoring fully paused)
+    return tfs;
 }
 function timeframeToSeconds(tf) {
     const map = {
@@ -708,6 +711,30 @@ async function getFuturesPairs() {
 
         return [];
     }
+}
+
+// Fetch ALL Delta Exchange perpetual futures symbols regardless of volume.
+// Used by the 1h+4h long group to monitor every listed contract.
+async function getAllDeltaSymbols() {
+    await enforceRateLimit();
+    const response = await axios.get(`${DELTA_REST_BASE_URL}/tickers`, {
+        params: { contract_types: 'perpetual_futures' },
+        timeout: 10000
+    });
+    const tickers = response?.data?.result;
+    if (!Array.isArray(tickers)) throw new Error('Unexpected Delta tickers response shape');
+    // Opportunistically fill tickerCache so get24HrStats() stays fast
+    for (const t of tickers) {
+        if (t.symbol) tickerCache.set(t.symbol, t);
+    }
+    // Cap at 250 symbols to prevent a REST rate-limit storm during kline backfill.
+    // Sort by turnover_usd descending so the most active pairs are always included.
+    const filtered = tickers
+        .filter(t => t.contract_type === 'perpetual_futures' && t.symbol)
+        .sort((a, b) => parseFloat(b.turnover_usd || 0) - parseFloat(a.turnover_usd || 0))
+        .slice(0, 250)
+        .map(t => t.symbol);
+    return filtered;
 }
 
 // Alert when new pairs cross the volume threshold
@@ -1752,6 +1779,10 @@ async function refreshWebSockets(chatId) {
 
         log('Reconnecting WebSockets with current settings...', 'info');
         await setupAllWebSockets();
+        // If the 1h+4h long group is active, re-subscribe it after volume pairs are back up
+        if (ENABLE_LONG_GROUP) {
+            await setupLongGroupWebSockets(null);
+        }
 
         if (chatId) await bot.sendMessage(chatId, '✅ *WebSocket connections re-established!*', { parse_mode: 'Markdown' }).catch(() => {});
         log('Graceful reconnect complete.', 'success');
@@ -1859,56 +1890,97 @@ async function handleCallbackQuery(callbackQuery) {
         } else if (action === 'toggle_fast_tfs' || action === 'toggle_fast_group') {
             // toggle_fast_tfs kept as alias for backward compat with any cached Telegram buttons
             if (FORCE_ALL_DUAL_TFS) {
-                await bot.sendMessage(chatId, '🔒 Timeframe groups are locked ON by environment config. Both 1m+3m and 5m+15m are always active.').catch(() => {});
+                await bot.sendMessage(chatId, '🔒 Timeframe groups are locked ON by environment config.').catch(() => {});
                 await sendSettingsMenu(chatId);
                 return;
             }
-            const wasAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP;
+            const wasAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP && !ENABLE_LONG_GROUP;
             INCLUDE_FAST_TFS = !INCLUDE_FAST_TFS;
             log(`1m+3m EMA 9/15 group ${INCLUDE_FAST_TFS ? 'enabled' : 'disabled'}`, 'success');
             saveSettings();
             emaCache.clear(); ema9Cache.clear(); ema15Cache.clear(); coinStates.clear();
-            const nowAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP;
+            const nowAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP && !ENABLE_LONG_GROUP;
             if (nowAllOff) {
-                // Both groups now off — shut everything down
                 await stopAllMonitoring(chatId);
             } else if (wasAllOff) {
-                // Coming back from fully paused — restart
                 await resumeMonitoring(chatId);
             } else {
+                const activeTfs = getDualEmaTimeframes();
                 await bot.sendMessage(
                     chatId,
                     INCLUDE_FAST_TFS
-                        ? `✅ 1m+3m group ON\nNow monitoring: ${getDualEmaTimeframes().join(' + ')}`
-                        : `❌ 1m+3m group OFF\nNow monitoring: ${getDualEmaTimeframes().join(' + ')}`
+                        ? `✅ 1m+3m group ON\nNow monitoring: ${activeTfs.join(' + ')}`
+                        : `❌ 1m+3m group OFF\nNow monitoring: ${activeTfs.join(' + ')}`
                 );
                 refreshWebSockets(chatId);
             }
             await sendSettingsMenu(chatId);
         } else if (action === 'toggle_slow_group') {
             if (FORCE_ALL_DUAL_TFS) {
-                await bot.sendMessage(chatId, '🔒 Timeframe groups are locked ON by environment config. Both 1m+3m and 5m+15m are always active.').catch(() => {});
+                await bot.sendMessage(chatId, '🔒 Timeframe groups are locked ON by environment config.').catch(() => {});
                 await sendSettingsMenu(chatId);
                 return;
             }
-            const wasAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP;
+            const wasAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP && !ENABLE_LONG_GROUP;
             ENABLE_SLOW_GROUP = !ENABLE_SLOW_GROUP;
             log(`5m+15m EMA 9/15 group ${ENABLE_SLOW_GROUP ? 'enabled' : 'disabled'}`, 'success');
             saveSettings();
             emaCache.clear(); ema9Cache.clear(); ema15Cache.clear(); coinStates.clear();
-            const nowAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP;
+            const nowAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP && !ENABLE_LONG_GROUP;
             if (nowAllOff) {
-                // Both groups now off — shut everything down
                 await stopAllMonitoring(chatId);
             } else if (wasAllOff) {
-                // Coming back from fully paused — restart
                 await resumeMonitoring(chatId);
             } else {
+                const activeTfs = getDualEmaTimeframes();
                 await bot.sendMessage(
                     chatId,
                     ENABLE_SLOW_GROUP
-                        ? `✅ 5m+15m group ON\nNow monitoring: ${getDualEmaTimeframes().join(' + ')}`
-                        : `❌ 5m+15m group OFF\nNow monitoring: ${getDualEmaTimeframes().join(' + ')}`
+                        ? `✅ 5m+15m group ON\nNow monitoring: ${activeTfs.join(' + ')}`
+                        : `❌ 5m+15m group OFF\nNow monitoring: ${activeTfs.join(' + ')}`
+                );
+                refreshWebSockets(chatId);
+            }
+            await sendSettingsMenu(chatId);
+        } else if (action === 'toggle_long_group') {
+            if (FORCE_ALL_DUAL_TFS) {
+                await bot.sendMessage(chatId, '🔒 Timeframe groups are locked ON by environment config.').catch(() => {});
+                await sendSettingsMenu(chatId);
+                return;
+            }
+            const wasAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP && !ENABLE_LONG_GROUP;
+            ENABLE_LONG_GROUP = !ENABLE_LONG_GROUP;
+            log(`1h+4h EMA 9/15 group (all Delta pairs) ${ENABLE_LONG_GROUP ? 'enabled' : 'disabled'}`, 'success');
+            saveSettings();
+            emaCache.clear(); ema9Cache.clear(); ema15Cache.clear(); coinStates.clear();
+            const nowAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP && !ENABLE_LONG_GROUP;
+            if (nowAllOff) {
+                // All three groups now off—shut everything down
+                await stopAllMonitoring(chatId);
+            } else if (ENABLE_LONG_GROUP) {
+                // Long group just turned ON
+                if (wasAllOff) {
+                    // Coming from fully-paused: restart heartbeat + periodic check first
+                    if (!heartbeatStarted) { startWebSocketHeartbeat(); heartbeatStarted = true; }
+                    if (!monitoringInterval) {
+                        monitoringInterval = setInterval(async () => {
+                            if (periodicCheckRunning) { return; }
+                            periodicCheckRunning = true;
+                            try { await checkEMACross({ emitAlerts: true }); }
+                            finally { periodicCheckRunning = false; }
+                        }, CHECK_INTERVAL);
+                    }
+                }
+                await setupLongGroupWebSockets(chatId);
+            } else {
+                // Long group just turned OFF—clear its symbols and remove from trackedPairs
+                // Volume-filtered pairs will be re-added by the next setupAllWebSockets() call
+                for (const s of longGroupSymbols) { trackedPairs.delete(s); }
+                longGroupSymbols.clear();
+                const activeTfs = getDualEmaTimeframes();
+                await bot.sendMessage(
+                    chatId,
+                    `❌ 1h+4h group OFF\nNow monitoring: ${activeTfs.length ? activeTfs.join(' + ') : 'Nothing (all paused)'}`
                 );
                 refreshWebSockets(chatId);
             }
@@ -1963,7 +2035,8 @@ function saveSettings() {
             ML_ENABLED,
             DUAL_EMA_MODE,
             INCLUDE_FAST_TFS,
-            ENABLE_SLOW_GROUP
+            ENABLE_SLOW_GROUP,
+            ENABLE_LONG_GROUP
         };
 
         fs.writeFile(
@@ -1996,7 +2069,8 @@ function loadSettings() {
                 'ML_ENABLED',
                 'DUAL_EMA_MODE',
                 'INCLUDE_FAST_TFS',
-                'ENABLE_SLOW_GROUP'
+                'ENABLE_SLOW_GROUP',
+                'ENABLE_LONG_GROUP'
             ]);
 
             for (const key of Object.keys(parsed)) {
@@ -2016,9 +2090,10 @@ function loadSettings() {
             DUAL_EMA_MODE = settings.DUAL_EMA_MODE !== undefined ? settings.DUAL_EMA_MODE : DUAL_EMA_MODE;
             if (typeof settings.INCLUDE_FAST_TFS === 'boolean') INCLUDE_FAST_TFS = settings.INCLUDE_FAST_TFS;
             if (typeof settings.ENABLE_SLOW_GROUP === 'boolean') ENABLE_SLOW_GROUP = settings.ENABLE_SLOW_GROUP;
+            if (typeof settings.ENABLE_LONG_GROUP === 'boolean') ENABLE_LONG_GROUP = settings.ENABLE_LONG_GROUP;
 
             // FORCE_ALL_DUAL_TFS env var takes hard precedence over any saved setting.Without this guard a stale settings.json with DUAL_EMA_MODE:false silently disables all crossover detection — producing zero alerts with no error shown.
-            if (FORCE_ALL_DUAL_TFS) { DUAL_EMA_MODE = true; INCLUDE_FAST_TFS = true; ENABLE_SLOW_GROUP = true; }
+            if (FORCE_ALL_DUAL_TFS) { DUAL_EMA_MODE = true; INCLUDE_FAST_TFS = true; ENABLE_SLOW_GROUP = true; ENABLE_LONG_GROUP = true; }
 
             log('Settings loaded from file', 'success');
         }
@@ -2286,9 +2361,13 @@ async function sendStartupMessage() {
 }
 
 // ── Pause / Resume helpers ───────────────────────────────────────────────────
-// Called when both TF groups are disabled. Tears down all live WS connections and stops the periodic REST backup check. No kline data is fetched, no REST calls are made → zero data cost until the user re-enables a group.
+// Called when ALL TF groups are disabled. Tears down all live WS connections and stops
+// the periodic REST backup check — zero data cost until a group is re-enabled.
 async function stopAllMonitoring(chatId) {
-    log('Both TF groups disabled — stopping all WebSocket and periodic monitoring', 'warning');
+    log('All TF groups disabled — stopping all WebSocket and periodic monitoring', 'warning');
+    // Remove long-group-only symbols from trackedPairs before clearing
+    for (const s of longGroupSymbols) { trackedPairs.delete(s); }
+    longGroupSymbols.clear();
     // Cancel periodic REST check
     if (monitoringInterval) {
         clearInterval(monitoringInterval);
@@ -2305,7 +2384,7 @@ async function stopAllMonitoring(chatId) {
     if (chatId) {
         await bot.sendMessage(
             chatId,
-            '⏸ *Monitoring paused.*\nAll WebSocket streams closed and REST polling stopped.\nRe-enable either TF group to resume — no data costs while paused.',
+            '⏸ *Monitoring paused.*\nAll WebSocket streams closed and REST polling stopped.\nRe-enable any TF group to resume — zero data cost while paused.',
             { parse_mode: 'Markdown' }
         ).catch(() => {});
     }
@@ -2319,7 +2398,12 @@ async function resumeMonitoring(chatId) {
     if (chatId) {
         await bot.sendMessage(chatId, '▶️ *Resuming monitoring...*', { parse_mode: 'Markdown' }).catch(() => {});
     }
+    // Reconnect volume-filtered pairs for fast/slow groups
     await setupAllWebSockets();
+    // If the long group is also active, subscribe ALL Delta symbols for 1h+4h
+    if (ENABLE_LONG_GROUP) {
+        await setupLongGroupWebSockets(null); // null = skip extra Telegram message here
+    }
     if (!heartbeatStarted) {
         startWebSocketHeartbeat();
         heartbeatStarted = true;
@@ -2341,11 +2425,49 @@ async function resumeMonitoring(chatId) {
         }, CHECK_INTERVAL);
     }
     if (chatId) {
-        await bot.sendMessage(chatId, `✅ *Monitoring resumed.* Now tracking: ${getDualEmaTimeframes().join(' + ')}`, { parse_mode: 'Markdown' }).catch(() => {});
+        const activeTfs = getDualEmaTimeframes();
+        await bot.sendMessage(chatId, `✅ *Monitoring resumed.* Now tracking: ${activeTfs.length ? activeTfs.join(' + ') : 'none'}`, { parse_mode: 'Markdown' }).catch(() => {});
     }
     log('Monitoring resumed successfully.', 'success');
 }
 
+
+// Setup 1h+4h long-group WebSockets for ALL Delta Exchange perpetual futures.
+// Merges them with the volume-filtered pairs in the WS pool.
+async function setupLongGroupWebSockets(chatId) {
+    log('Setting up 1h+4h long-group WebSockets for all Delta Exchange pairs...', 'info');
+    try {
+        const allSymbols = await getAllDeltaSymbols();
+        longGroupSymbols = new Set(allSymbols);
+        // Add long-group symbols to trackedPairs so the heartbeat reconnects them on WS drop
+        for (const s of longGroupSymbols) trackedPairs.add(s);
+        log(`Long group: fetched ${longGroupSymbols.size} Delta Exchange symbols`, 'info');
+        // Merge with volume-filtered pairs so their fast/slow TF streams stay alive
+        const mergedSymbols = Array.from(new Set([...trackedPairs, ...longGroupSymbols]));
+        // Close existing pool and rebuild with the merged symbol list
+        isReconnecting = true;
+        for (const entry of wsPool) {
+            if (entry && entry.ws) { try { entry.ws.close(); } catch (_) {} }
+        }
+        wsPool.length = 0;
+        reconnectionAttempts.clear();
+        isReconnecting = false;
+        setupPooledWebSockets(mergedSymbols);
+        if (chatId) {
+            await bot.sendMessage(
+                chatId,
+                `✅ *1h+4h group ON*\nMonitoring EMA 9/15 crossovers on 1h + 4h for all ${longGroupSymbols.size} Delta Exchange perpetual futures.`,
+                { parse_mode: 'Markdown' }
+            ).catch(() => {});
+        }
+    } catch (e) {
+        log(`Error setting up long-group WebSockets: ${e.message}`, 'error');
+        ENABLE_LONG_GROUP = false; // rollback so state stays consistent
+        if (chatId) {
+            await bot.sendMessage(chatId, `❌ Failed to start 1h+4h group: ${e.message}`).catch(() => {});
+        }
+    }
+}
 
 // WebSocket heartbeat function — operates on the pool instead of per-symbol connections
 function startWebSocketHeartbeat() {
