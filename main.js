@@ -21,8 +21,11 @@ let ML_ENABLED = false;
 
 // Dual EMA crossover mode: always true — EMA(9) vs EMA(15) only. Single-EMA code is in src/single_ema_engine.js.
 let DUAL_EMA_MODE = true;
-// Optional fast timeframe addon for dual mode: include 1m+3m alongside 5m+15m
+// Two independent timeframe groups for dual EMA 9/15 crossover mode.
+// FAST group: 1m + 3m  |  SLOW group: 5m + 15m
+// Both can be ON at the same time (default). Each is toggled via the Settings menu.
 let INCLUDE_FAST_TFS = (process.env.INCLUDE_FAST_TFS || 'true').toLowerCase() === 'true';
+let ENABLE_SLOW_GROUP = true; // 5m + 15m group — separate toggle, on by default
 const FORCE_ALL_DUAL_TFS = (process.env.FORCE_ALL_DUAL_TFS || 'true').toLowerCase() === 'true';
 
 // Configuration
@@ -264,6 +267,10 @@ let isTelegramReconnecting = false;
 // both chains race into shouldAlert(), consuming cooldowns with no alert sent.
 let periodicCheckRunning = false;
 let monitoringInterval = null; // Reference to the periodic check interval
+// Tracks whether startWebSocketHeartbeat() has ever been called.
+// Heartbeat setIntervals run forever so we only call it once; pausing is done
+// by letting the heartbeat skip work while wsPool is empty.
+let heartbeatStarted = false;
 
 // Prevent destructive commands from being spammed concurrently.
 const COMMAND_COOLDOWN_MS = 30 * 1000;
@@ -379,12 +386,21 @@ function activeTimeframeLabel(tf = '') {
     return TIMEFRAME;
 }
 // Central source of truth for dual-mode timeframe set.
+// Each group (1m+3m and 5m+15m) can be toggled independently from the Settings menu.
 function isFastTfsActive() {
     return FORCE_ALL_DUAL_TFS || INCLUDE_FAST_TFS;
 }
+function isSlowGroupActive() {
+    return FORCE_ALL_DUAL_TFS || ENABLE_SLOW_GROUP;
+}
 
 function getDualEmaTimeframes() {
-    return isFastTfsActive() ? ['1m', '3m', '5m', '15m'] : ['5m', '15m'];
+    if (FORCE_ALL_DUAL_TFS) return ['1m', '3m', '5m', '15m'];
+    const tfs = [];
+    if (INCLUDE_FAST_TFS) tfs.push('1m', '3m');
+    if (ENABLE_SLOW_GROUP) tfs.push('5m', '15m');
+    // Safety fallback: always return at least the slow group so alerts never stop completely
+    return tfs.length ? tfs : ['5m', '15m'];
 }
 function timeframeToSeconds(tf) {
     const map = {
@@ -1840,33 +1856,63 @@ async function handleCallbackQuery(callbackQuery) {
             );
             await sendSettingsMenu(chatId); // show updated menu immediately
             refreshWebSockets(chatId);      // reconnect in background — sends its own progress msgs
-        } else if (action === 'toggle_fast_tfs') {
+        } else if (action === 'toggle_fast_tfs' || action === 'toggle_fast_group') {
+            // toggle_fast_tfs kept as alias for backward compat with any cached Telegram buttons
             if (FORCE_ALL_DUAL_TFS) {
-                await bot.sendMessage(
-                    chatId,
-                    '⚡ *Fast TF Add-on is locked ON by FORCE_ALL_DUAL_TFS=true*\nDual EMA mode always monitors 1m + 3m + 5m + 15m.',
-                    { parse_mode: 'Markdown' }
-                );
+                await bot.sendMessage(chatId, '🔒 Timeframe groups are locked ON by environment config. Both 1m+3m and 5m+15m are always active.').catch(() => {});
                 await sendSettingsMenu(chatId);
                 return;
             }
-
+            const wasAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP;
             INCLUDE_FAST_TFS = !INCLUDE_FAST_TFS;
-            log(`Fast dual timeframes ${INCLUDE_FAST_TFS ? 'enabled' : 'disabled'}`, 'success');
+            log(`1m+3m EMA 9/15 group ${INCLUDE_FAST_TFS ? 'enabled' : 'disabled'}`, 'success');
             saveSettings();
-            emaCache.clear();
-            ema9Cache.clear();
-            ema15Cache.clear();
-            coinStates.clear();
-            await bot.sendMessage(
-                chatId,
-                INCLUDE_FAST_TFS
-                    ? '⚡ *Fast TF Add-on Enabled*\nDual EMA mode will monitor 1m + 3m + 5m + 15m together.'
-                    : '⚡ *Fast TF Add-on Disabled*\nDual EMA mode will monitor 5m + 15m only.',
-                { parse_mode: 'Markdown' }
-            );
+            emaCache.clear(); ema9Cache.clear(); ema15Cache.clear(); coinStates.clear();
+            const nowAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP;
+            if (nowAllOff) {
+                // Both groups now off — shut everything down
+                await stopAllMonitoring(chatId);
+            } else if (wasAllOff) {
+                // Coming back from fully paused — restart
+                await resumeMonitoring(chatId);
+            } else {
+                await bot.sendMessage(
+                    chatId,
+                    INCLUDE_FAST_TFS
+                        ? `✅ 1m+3m group ON\nNow monitoring: ${getDualEmaTimeframes().join(' + ')}`
+                        : `❌ 1m+3m group OFF\nNow monitoring: ${getDualEmaTimeframes().join(' + ')}`
+                );
+                refreshWebSockets(chatId);
+            }
             await sendSettingsMenu(chatId);
-            refreshWebSockets(chatId);
+        } else if (action === 'toggle_slow_group') {
+            if (FORCE_ALL_DUAL_TFS) {
+                await bot.sendMessage(chatId, '🔒 Timeframe groups are locked ON by environment config. Both 1m+3m and 5m+15m are always active.').catch(() => {});
+                await sendSettingsMenu(chatId);
+                return;
+            }
+            const wasAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP;
+            ENABLE_SLOW_GROUP = !ENABLE_SLOW_GROUP;
+            log(`5m+15m EMA 9/15 group ${ENABLE_SLOW_GROUP ? 'enabled' : 'disabled'}`, 'success');
+            saveSettings();
+            emaCache.clear(); ema9Cache.clear(); ema15Cache.clear(); coinStates.clear();
+            const nowAllOff = !INCLUDE_FAST_TFS && !ENABLE_SLOW_GROUP;
+            if (nowAllOff) {
+                // Both groups now off — shut everything down
+                await stopAllMonitoring(chatId);
+            } else if (wasAllOff) {
+                // Coming back from fully paused — restart
+                await resumeMonitoring(chatId);
+            } else {
+                await bot.sendMessage(
+                    chatId,
+                    ENABLE_SLOW_GROUP
+                        ? `✅ 5m+15m group ON\nNow monitoring: ${getDualEmaTimeframes().join(' + ')}`
+                        : `❌ 5m+15m group OFF\nNow monitoring: ${getDualEmaTimeframes().join(' + ')}`
+                );
+                refreshWebSockets(chatId);
+            }
+            await sendSettingsMenu(chatId);
         } else if (action.startsWith('volume_')) {
             const newVolume = parseInt(action.replace('volume_', ''), 10);
             if (!VALID_VOLUMES.includes(newVolume)) {
@@ -1916,7 +1962,8 @@ function saveSettings() {
             ALERT_COOLDOWN,
             ML_ENABLED,
             DUAL_EMA_MODE,
-            INCLUDE_FAST_TFS
+            INCLUDE_FAST_TFS,
+            ENABLE_SLOW_GROUP
         };
 
         fs.writeFile(
@@ -1948,7 +1995,8 @@ function loadSettings() {
                 'ALERT_COOLDOWN',
                 'ML_ENABLED',
                 'DUAL_EMA_MODE',
-                'INCLUDE_FAST_TFS'
+                'INCLUDE_FAST_TFS',
+                'ENABLE_SLOW_GROUP'
             ]);
 
             for (const key of Object.keys(parsed)) {
@@ -1967,9 +2015,10 @@ function loadSettings() {
             ML_ENABLED = settings.ML_ENABLED !== undefined ? settings.ML_ENABLED : ML_ENABLED;
             DUAL_EMA_MODE = settings.DUAL_EMA_MODE !== undefined ? settings.DUAL_EMA_MODE : DUAL_EMA_MODE;
             if (typeof settings.INCLUDE_FAST_TFS === 'boolean') INCLUDE_FAST_TFS = settings.INCLUDE_FAST_TFS;
+            if (typeof settings.ENABLE_SLOW_GROUP === 'boolean') ENABLE_SLOW_GROUP = settings.ENABLE_SLOW_GROUP;
 
             // FORCE_ALL_DUAL_TFS env var takes hard precedence over any saved setting.Without this guard a stale settings.json with DUAL_EMA_MODE:false silently disables all crossover detection — producing zero alerts with no error shown.
-            if (FORCE_ALL_DUAL_TFS) DUAL_EMA_MODE = true;
+            if (FORCE_ALL_DUAL_TFS) { DUAL_EMA_MODE = true; INCLUDE_FAST_TFS = true; ENABLE_SLOW_GROUP = true; }
 
             log('Settings loaded from file', 'success');
         }
@@ -2042,8 +2091,25 @@ async function sendStatusUpdate(chatId) {
 
 // Send settings menu with ML toggle and dual EMA option
 async function sendSettingsMenu(chatId) {
+    const fastOn = FORCE_ALL_DUAL_TFS || INCLUDE_FAST_TFS;
+    const slowOn = FORCE_ALL_DUAL_TFS || ENABLE_SLOW_GROUP;
+    const locked = FORCE_ALL_DUAL_TFS;
+    // Both groups off = monitoring fully paused (no WS connections, no REST calls)
+    const allPaused = DUAL_EMA_MODE && !fastOn && !slowOn;
+
     const keyboard = {
         inline_keyboard: [
+            // TF group toggles — show only in dual EMA mode
+            ...(DUAL_EMA_MODE ? [[
+                {
+                    text: `1m+3m: ${fastOn ? 'ON ✅' : 'OFF ❌'}${locked ? ' 🔒' : ''}`,
+                    callback_data: 'toggle_fast_group'
+                },
+                {
+                    text: `5m+15m: ${slowOn ? 'ON ✅' : 'OFF ❌'}${locked ? ' 🔒' : ''}`,
+                    callback_data: 'toggle_slow_group'
+                }
+            ]] : []),
             [
                 { text: 'Vol 2M',   callback_data: 'volume_2000000'   },
                 { text: 'Vol 5M',   callback_data: 'volume_5000000'   }
@@ -2060,29 +2126,29 @@ async function sendSettingsMenu(chatId) {
                 { text: 'Vol 200M', callback_data: 'volume_200000000' }
             ],
             [
-                { text: `ML: ${ML_ENABLED ? 'Enabled \u2705' : 'Disabled \u274c'}`, callback_data: 'toggle_ml' }
+                { text: `ML: ${ML_ENABLED ? 'Enabled ✅' : 'Disabled ❌'}`, callback_data: 'toggle_ml' }
             ],
-            [{ text: '\ud83d\udd19 Back to Menu', callback_data: 'menu' }]
+            [{ text: '🔙 Back to Menu', callback_data: 'menu' }]
         ]
     };
 
-    // NOTE: Do NOT use Markdown parse_mode here — env variable names (e.g. FORCE_ALL_DUAL_TFS)
-    // contain underscores that Telegram Markdown parser treats as italic delimiters, causing
-    // sendMessage to throw and the settings panel to never appear.
-    const tfs = getDualEmaTimeframes().join(' + ');
-    const fastTfStatus = FORCE_ALL_DUAL_TFS
-        ? 'Locked ON (forced by env)'
-        : (INCLUDE_FAST_TFS ? 'Enabled' : 'Disabled');
+    // NOTE: No parse_mode — env var names with underscores crash Telegram Markdown parser.
+    const tfs = getDualEmaTimeframes();
+    const activeTfText = tfs.length ? tfs.join(' + ') : 'None (paused)';
+    const lockedNote = locked ? ' (locked ON by env)' : '';
 
-    const configText = DUAL_EMA_MODE
-        ? `\u2699\ufe0f Settings\n\nActive Mode: EMA 9/15 Crossover\nTimeframes: ${tfs}\nFast TF Add-on: ${fastTfStatus}\nVolume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\nMachine Learning: ${ML_ENABLED ? 'Enabled' : 'Disabled'}\n\nSelect what to change:`
-        : `\u2699\ufe0f Settings\n\nActive Mode: Price vs EMA ${EMA_PERIOD}\nTimeframe: ${TIMEFRAME}\nVolume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\nMachine Learning: ${ML_ENABLED ? 'Enabled' : 'Disabled'}\n\nSelect what to change:`;
+    let configText;
+    if (DUAL_EMA_MODE) {
+        if (allPaused) {
+            configText = `⚙️ Settings\n\n⏸ MONITORING PAUSED\nBoth TF groups are OFF — all WebSocket streams closed, zero data cost.\nTap 1m+3m or 5m+15m to resume.\n\nVolume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\nMachine Learning: ${ML_ENABLED ? 'Enabled' : 'Disabled'}`;
+        } else {
+            configText = `⚙️ Settings\n\nMode: EMA 9/15 Crossover\nActive TFs: ${activeTfText}${lockedNote}\nVolume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\nMachine Learning: ${ML_ENABLED ? 'Enabled' : 'Disabled'}\n\nTap a TF button to toggle that group. Both can be ON at the same time. Turn both OFF to pause all monitoring.`;
+        }
+    } else {
+        configText = `⚙️ Settings\n\nActive Mode: Price vs EMA ${EMA_PERIOD}\nTimeframe: ${TIMEFRAME}\nVolume Threshold: ${formatVolume(VOLUME_THRESHOLD)}\nMachine Learning: ${ML_ENABLED ? 'Enabled' : 'Disabled'}\n\nSelect what to change:`;
+    }
 
-    // No parse_mode: plain text avoids Markdown crash from env var names containing underscores
-    await bot.sendMessage(chatId, configText, {
-        reply_markup: keyboard,
-        //parse_mode:'Markdown' // why remove it? 
-    });
+    await bot.sendMessage(chatId, configText, { reply_markup: keyboard });
 }
 async function sendHelpMessage(chatId) {
     const helpText = `*EMA Tracker Bot Help*\n\n` +
@@ -2218,6 +2284,68 @@ async function sendStartupMessage() {
         log(`Error sending startup message: ${error.message}`, 'error');
     }
 }
+
+// ── Pause / Resume helpers ───────────────────────────────────────────────────
+// Called when both TF groups are disabled. Tears down all live WS connections and stops the periodic REST backup check. No kline data is fetched, no REST calls are made → zero data cost until the user re-enables a group.
+async function stopAllMonitoring(chatId) {
+    log('Both TF groups disabled — stopping all WebSocket and periodic monitoring', 'warning');
+    // Cancel periodic REST check
+    if (monitoringInterval) {
+        clearInterval(monitoringInterval);
+        monitoringInterval = null;
+    }
+    // Close every pool WS
+    isReconnecting = true; // prevent heartbeat from re-opening during teardown
+    for (const entry of wsPool) {
+        if (entry && entry.ws) { try { entry.ws.close(); } catch (e) { /* ignore */ } }
+    }
+    wsPool.length = 0;
+    reconnectionAttempts.clear();
+    isReconnecting = false;
+    if (chatId) {
+        await bot.sendMessage(
+            chatId,
+            '⏸ *Monitoring paused.*\nAll WebSocket streams closed and REST polling stopped.\nRe-enable either TF group to resume — no data costs while paused.',
+            { parse_mode: 'Markdown' }
+        ).catch(() => {});
+    }
+    log('All monitoring stopped successfully.', 'success');
+}
+
+// Called when a TF group is re-enabled from a fully-paused state.
+// Re-opens WS connections and restarts the periodic backup check.
+async function resumeMonitoring(chatId) {
+    log('A TF group re-enabled — resuming all WebSocket and periodic monitoring', 'info');
+    if (chatId) {
+        await bot.sendMessage(chatId, '▶️ *Resuming monitoring...*', { parse_mode: 'Markdown' }).catch(() => {});
+    }
+    await setupAllWebSockets();
+    if (!heartbeatStarted) {
+        startWebSocketHeartbeat();
+        heartbeatStarted = true;
+    }
+    // Restart periodic backup check if it was cleared
+    if (!monitoringInterval) {
+        monitoringInterval = setInterval(async () => {
+            if (periodicCheckRunning) {
+                log('Periodic check already running — skipping this cycle to prevent overlap', 'warning');
+                return;
+            }
+            periodicCheckRunning = true;
+            try {
+                log('Running periodic check as backup to WebSockets...', 'info');
+                await checkEMACross({ emitAlerts: true });
+            } finally {
+                periodicCheckRunning = false;
+            }
+        }, CHECK_INTERVAL);
+    }
+    if (chatId) {
+        await bot.sendMessage(chatId, `✅ *Monitoring resumed.* Now tracking: ${getDualEmaTimeframes().join(' + ')}`, { parse_mode: 'Markdown' }).catch(() => {});
+    }
+    log('Monitoring resumed successfully.', 'success');
+}
+
 
 // WebSocket heartbeat function — operates on the pool instead of per-symbol connections
 function startWebSocketHeartbeat() {
@@ -2463,7 +2591,10 @@ async function initialize() {
         await setupAllWebSockets();
 
         // Start WebSocket heartbeat
-        startWebSocketHeartbeat();
+        if (!heartbeatStarted) {
+            startWebSocketHeartbeat();
+            heartbeatStarted = true;
+        }
 
         // Periodically reset reconnection counters for maxed-out pool connections
         setInterval(() => {
